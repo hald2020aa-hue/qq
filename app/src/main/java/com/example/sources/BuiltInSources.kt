@@ -1,10 +1,13 @@
 package com.example.sources
 
+import android.webkit.CookieManager
 import com.example.core.common.PipelineLogger
 import com.example.core.common.PipelineStage
 import com.example.core.verification.VerificationDetectionResult
 import com.example.core.verification.VerificationManager
 import com.example.core.verification.VerificationRequiredException
+import com.example.domain.models.ContentRating
+import com.example.domain.models.ContentSafetyClassifier
 import com.example.domain.models.MangaChapter
 import com.example.domain.models.MangaDetails
 import com.example.domain.models.MangaPage
@@ -89,6 +92,8 @@ abstract class ConfigurableHtmlMangaSource(
 
     override val baseUrl: String = "https://$domain"
 
+    protected open val allowLiveApiFallback: Boolean = true
+
     protected var verificationManager: VerificationManager? = null
 
     // Remembers catalog summaries and latest chapter numbers discovered on the catalog page
@@ -128,7 +133,8 @@ abstract class ConfigurableHtmlMangaSource(
         .followSslRedirects(true)
         .build()
 
-    protected fun buildGetRequest(url: String, referer: String = "$baseUrl/"): Request {
+    protected open fun buildGetRequest(url: String, referer: String = "$baseUrl/"): Request {
+        val cookieHeader = runCatching { CookieManager.getInstance().getCookie(url) }.getOrNull()
         return Request.Builder()
             .url(url)
             .header(
@@ -138,6 +144,11 @@ abstract class ConfigurableHtmlMangaSource(
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7")
             .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
             .header("Referer", referer)
+            .apply {
+                if (!cookieHeader.isNullOrBlank()) {
+                    header("Cookie", cookieHeader)
+                }
+            }
             .build()
     }
 
@@ -298,14 +309,16 @@ abstract class ConfigurableHtmlMangaSource(
             )
         }
 
-        // 2. Live API Bridge when direct HTML scraping is blocked by Cloudflare/ISP or domain redirect
-        val liveApiItems = fetchLiveManhwaFromApi(page = page, searchQuery = null)
-        if (liveApiItems.isNotEmpty()) {
-            return@withContext PageResult(
-                items = liveApiItems,
-                page = page,
-                hasNextPage = true
-            )
+        // 2. Live API Bridge when direct HTML scraping is blocked by Cloudflare/ISP or domain redirect (only for built-in sources)
+        if (allowLiveApiFallback) {
+            val liveApiItems = fetchLiveManhwaFromApi(page = page, searchQuery = null)
+            if (liveApiItems.isNotEmpty()) {
+                return@withContext PageResult(
+                    items = liveApiItems,
+                    page = page,
+                    hasNextPage = true
+                )
+            }
         }
 
         throw IllegalStateException(
@@ -353,8 +366,11 @@ abstract class ConfigurableHtmlMangaSource(
             )
         }
 
-        val apiSearchItems = fetchLiveManhwaFromApi(page = page, searchQuery = cleanQuery)
-        PageResult(items = apiSearchItems, page = page, hasNextPage = false)
+        if (allowLiveApiFallback) {
+            val apiSearchItems = fetchLiveManhwaFromApi(page = page, searchQuery = cleanQuery)
+            return@withContext PageResult(items = apiSearchItems, page = page, hasNextPage = false)
+        }
+        PageResult(items = emptyList(), page = page, hasNextPage = false)
     }
 
     override suspend fun getDetails(mangaUrl: String): MangaDetails = withContext(Dispatchers.IO) {
@@ -724,6 +740,16 @@ abstract class ConfigurableHtmlMangaSource(
                 .map { it.text().trim() }
                 .filter { it.isNotEmpty() }
 
+            val finalGenres = genresText.ifEmpty { listOf("مانهوا", "أكشن", "اكشن", "فانتازيا") }
+            if (ContentSafetyClassifier.isProhibitedIllegalContent(rawTitle, "", finalGenres)) {
+                return@mapIndexedNotNull null
+            }
+            val ratingEnum = ContentSafetyClassifier.classifyFromGenresAndText(
+                genres = finalGenres,
+                title = rawTitle,
+                domain = domain
+            )
+
             val summary = MangaSummary(
                 id = "${id}_$slug",
                 sourceId = id,
@@ -731,9 +757,10 @@ abstract class ConfigurableHtmlMangaSource(
                 coverUrl = extractedCover,
                 mangaUrl = resolvedHref,
                 latestChapter = latest?.ifBlank { null } ?: "متاح",
-                genres = genresText.ifEmpty { listOf("مانهوا", "أكشن", "اكشن", "فانتازيا") },
+                genres = finalGenres,
                 rating = 4.7f,
-                status = "OnGoing"
+                status = "OnGoing",
+                contentRating = ratingEnum
             )
             cachedWorkSummaries[resolvedHref.trimEnd('/')] = summary
             summary
@@ -883,6 +910,16 @@ abstract class ConfigurableHtmlMangaSource(
         val mangaId = "${id}_$slug"
         val chapters = parseChaptersFromDoc(doc, mangaId, mangaUrl)
 
+        if (ContentSafetyClassifier.isProhibitedIllegalContent(rawTitle, desc, genres)) {
+            return null
+        }
+        val contentRating = ContentSafetyClassifier.classifyFromGenresAndText(
+            genres = genres,
+            title = rawTitle,
+            description = desc,
+            domain = domain
+        )
+
         return MangaDetails(
             id = mangaId,
             sourceId = id,
@@ -895,7 +932,8 @@ abstract class ConfigurableHtmlMangaSource(
             status = status,
             genres = genres,
             rating = 4.7f,
-            chapters = chapters
+            chapters = chapters,
+            contentRating = contentRating
         )
     }
 
@@ -1086,10 +1124,40 @@ abstract class ConfigurableHtmlMangaSource(
 
             response.use { resp ->
                 val body = resp.body?.string().orEmpty()
+                PipelineLogger.log(
+                    stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                    sourceId = id,
+                    sourceName = name,
+                    resultCount = body.length,
+                    status = "HTTP_${resp.code}",
+                    details = "apiUrl=$apiUrl"
+                )
                 if (!resp.isSuccessful) return emptyList()
-                MangaDexApiHelper.parseMangaListResponse(body, sourceId = id)
+                PipelineLogger.log(
+                    stage = PipelineStage.PARSER_STARTED,
+                    sourceId = id,
+                    sourceName = name,
+                    status = "JSON_MANGADEX_V5"
+                )
+                val parsed = MangaDexApiHelper.parseMangaListResponse(body, sourceId = id)
+                PipelineLogger.log(
+                    stage = PipelineStage.PARSER_COMPLETED,
+                    sourceId = id,
+                    sourceName = name,
+                    resultCount = parsed.size,
+                    status = if (parsed.isNotEmpty()) "SUCCESS" else "EMPTY"
+                )
+                parsed
             }
         } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "API_FAILED",
+                failureReason = e.message,
+                throwable = e
+            )
             emptyList()
         }
     }
@@ -1225,6 +1293,8 @@ class DynamicSiteSource(
     chapterRowSelector = "li.wp-manga-chapter, #chapterlist li, .eplister ul li, .listing-chapters_wrap li",
     readerImagesSelector = ".reading-content img, .page-break img, #readerarea img, img.wp-manga-chapter-img, img.manga-chapter-img"
 ) {
+    override val allowLiveApiFallback: Boolean = false
+
     companion object {
         private val PALETTE = listOf(
             0xFFD32F2F,

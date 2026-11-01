@@ -30,11 +30,38 @@ interface MangaDao {
     @Query("UPDATE sources SET isEnabled = :enabled, status = :status WHERE id = :sourceId")
     suspend fun updateSourceEnabled(sourceId: String, enabled: Boolean, status: String)
 
+    @Query("UPDATE sources SET status = :status, extractedMangaCount = :mangaCount, extractedChaptersCount = :chaptersCount, extractedPagesCount = :pagesCount, lastError = :lastError, lastCheckedAt = :timestamp WHERE id = :sourceId")
+    suspend fun updateSourceDiagnostics(
+        sourceId: String,
+        status: String,
+        mangaCount: Int,
+        chaptersCount: Int,
+        pagesCount: Int,
+        lastError: String?,
+        timestamp: Long = System.currentTimeMillis()
+    )
+
     @Query("DELETE FROM sources WHERE id = :sourceId")
     suspend fun deleteSource(sourceId: String)
 
     @Query("DELETE FROM sources")
     suspend fun clearAllSources()
+
+    // ─── SOURCE CONFIGURATIONS ───
+    @Query("SELECT * FROM source_configurations WHERE sourceId = :sourceId LIMIT 1")
+    suspend fun getSourceConfigById(sourceId: String): SourceConfigEntity?
+
+    @Query("SELECT * FROM source_configurations WHERE domain = :domain LIMIT 1")
+    suspend fun getSourceConfigByDomain(domain: String): SourceConfigEntity?
+
+    @Query("SELECT * FROM source_configurations")
+    suspend fun getAllSourceConfigs(): List<SourceConfigEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertSourceConfig(config: SourceConfigEntity)
+
+    @Query("DELETE FROM source_configurations WHERE sourceId = :sourceId")
+    suspend fun deleteSourceConfig(sourceId: String)
 
     // ─── MANGA ───
     @Query("SELECT * FROM manga WHERE sourceId = :sourceId ORDER BY updatedAt DESC")

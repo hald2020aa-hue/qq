@@ -21,6 +21,7 @@ import com.example.core.verification.VerificationState
 import com.example.data.repositories.MangaRepository
 import com.example.data.repositories.SourceRepository
 import com.example.domain.models.AppThemeStyle
+import com.example.domain.models.ContentRating
 import com.example.domain.models.DownloadTask
 import com.example.domain.models.GridDisplayMode
 import com.example.domain.models.MangaChapter
@@ -28,8 +29,12 @@ import com.example.domain.models.MangaDetails
 import com.example.domain.models.MangaPage
 import com.example.domain.models.MangaSummary
 import com.example.domain.models.ReaderMode
+import com.example.domain.models.SiteInspectionReport
 import com.example.domain.models.SortOption
+import com.example.domain.models.SourceConfiguration
 import com.example.domain.models.SourceDiagnosticReport
+import com.example.domain.models.SourceEngineType
+import com.example.domain.models.SourceFullTestReport
 import com.example.domain.models.SourceInfo
 import com.example.domain.models.SourceStatus
 import com.example.domain.models.StatusFilter
@@ -37,13 +42,18 @@ import com.example.sourceapi.SourceManager
 import com.example.sourceapi.SourceRegistry
 import com.example.sourceapi.SourceValidationStepResult
 import com.example.sourceapi.SourceValidator
+import com.example.sources.AzoraMangaSource
+import com.example.sources.MangaDexSource
+import com.example.sources.MangalekSource
+import com.example.sources.MangastarzSource
+import com.example.sources.MangatekSource
+import com.example.sources.TeamXSource
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -55,6 +65,7 @@ sealed class ScreenRoute {
     data object Updates : ScreenRoute()
     data object Favorites : ScreenRoute()
     data object History : ScreenRoute()
+    data object AdultSection : ScreenRoute()
     data object SourceManager : ScreenRoute()
     data object SourceDiagnostics : ScreenRoute()
     data class Browser(val initialUrl: String = "https://www.google.com") : ScreenRoute()
@@ -79,6 +90,7 @@ data class AddSiteDialogState(
     val errorMessageAr: String? = null,
     val showManualConfirmDialog: Boolean = false,
     val manualSiteName: String = "",
+    val selectedContentRating: ContentRating = ContentRating.GENERAL,
     val pendingValidationResult: SourceValidationStepResult? = null,
     val showCloudflareDialog: Boolean = false,
     val cloudflareDomain: String = "",
@@ -142,8 +154,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         repository = verificationRepository
     )
 
-    // Starts completely empty — all manga websites are added manually by the user
-    val registry = SourceRegistry(emptyList())
+    // Fix #1: Register all 6 built-in specialized sources in SourceRegistry
+    val registry = SourceRegistry(
+        listOf(
+            MangalekSource(),
+            MangastarzSource(),
+            TeamXSource(),
+            MangatekSource(),
+            AzoraMangaSource(),
+            MangaDexSource()
+        )
+    )
     private val validator = SourceValidator(registry, verificationManager)
     val sourceManager = SourceManager(registry, validator, verificationManager)
     private val downloadEngine = DownloadEngine(application, db, storage, registry)
@@ -238,6 +259,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isRunningDiagnostics = MutableStateFlow(false)
     val isRunningDiagnostics: StateFlow<Boolean> = _isRunningDiagnostics.asStateFlow()
 
+    // ─── UNIVERSAL SOURCE ENGINE STATES ───
+    private val _latestInspectionReport = MutableStateFlow<SiteInspectionReport?>(null)
+    val latestInspectionReport: StateFlow<SiteInspectionReport?> = _latestInspectionReport.asStateFlow()
+
+    private val _isInspectingSite = MutableStateFlow(false)
+    val isInspectingSite: StateFlow<Boolean> = _isInspectingSite.asStateFlow()
+
+    private val _fullTestReports = MutableStateFlow<Map<String, SourceFullTestReport>>(emptyMap())
+    val fullTestReports: StateFlow<Map<String, SourceFullTestReport>> = _fullTestReports.asStateFlow()
+
+    private val _isRunningFullTest = MutableStateFlow(false)
+    val isRunningFullTest: StateFlow<Boolean> = _isRunningFullTest.asStateFlow()
+
+    private val _editingSourceConfig = MutableStateFlow<SourceConfiguration?>(null)
+    val editingSourceConfig: StateFlow<SourceConfiguration?> = _editingSourceConfig.asStateFlow()
+
+    private val _configPreviewItems = MutableStateFlow<List<MangaSummary>>(emptyList())
+    val configPreviewItems: StateFlow<List<MangaSummary>> = _configPreviewItems.asStateFlow()
+
+    private val _isPreviewingConfig = MutableStateFlow(false)
+    val isPreviewingConfig: StateFlow<Boolean> = _isPreviewingConfig.asStateFlow()
+
+    private val _exportedConfigJson = MutableStateFlow<String?>(null)
+    val exportedConfigJson: StateFlow<String?> = _exportedConfigJson.asStateFlow()
+
     private val _storageStats = MutableStateFlow(
         StorageStats(
             downloadsBytes = 0L,
@@ -255,12 +301,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var detailsLoadJob: Job? = null
 
     init {
+        // Fix #3: Restore all saved sources and register the 6 built-in sources without wiping Room
         viewModelScope.launch {
-            val clearedBefore = preferences.initialSourcesClearedFlow.first()
-            if (!clearedBefore) {
-                repository.clearAllSources()
-                preferences.markInitialSourcesCleared()
-            }
             repository.ensureDefaultSourcesRegistered()
         }
         refreshStorageStats()
@@ -415,6 +457,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isChecking = false,
                 showManualConfirmDialog = true,
                 manualSiteName = stepResult.suggestedName,
+                selectedContentRating = stepResult.inspectionReport?.detectedContentRating ?: ContentRating.GENERAL,
                 pendingValidationResult = stepResult
             )
         }
@@ -472,6 +515,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 showCloudflareDialog = false,
                 showManualConfirmDialog = true,
                 manualSiteName = revalidated?.suggestedName ?: domain,
+                selectedContentRating = revalidated?.inspectionReport?.detectedContentRating ?: ContentRating.GENERAL,
                 pendingValidationResult = revalidated
             )
         }
@@ -560,15 +604,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _addSiteDialog.value = _addSiteDialog.value.copy(manualSiteName = name)
     }
 
+    fun updateSelectedSiteContentRating(rating: ContentRating) {
+        _addSiteDialog.value = _addSiteDialog.value.copy(selectedContentRating = rating)
+    }
+
     fun confirmManualSiteAddition() {
         val state = _addSiteDialog.value
         val pending = state.pendingValidationResult ?: return
         viewModelScope.launch {
-            val addRes = repository.confirmAndAddSource(pending, state.manualSiteName)
+            val addRes = repository.confirmAndAddSource(
+                validationResult = pending,
+                customSiteName = state.manualSiteName,
+                overrideRating = state.selectedContentRating
+            )
             _addSiteDialog.value = AddSiteDialogState()
             if (addRes.isSuccess) {
                 _showRestartBanner.value = true
-                showToast("تم الإضافة بنجاح")
+                showToast("تم الإضافة بنجاح (${addRes.getOrNull()?.status?.labelAr ?: ""})")
             } else {
                 showToast(addRes.exceptionOrNull()?.message ?: "تعذّر إضافة الموقع")
             }
@@ -626,6 +678,147 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             _isRunningDiagnostics.value = false
             showToast("اكتمل فحص المصادر")
+        }
+    }
+
+    // ─── UNIVERSAL SOURCE ENGINE ACTIONS ───
+    fun inspectSiteUrl(rawUrl: String) {
+        if (rawUrl.isBlank()) {
+            showToast("يرجى إدخال رابط أو نطاق الموقع أولاً")
+            return
+        }
+        viewModelScope.launch {
+            _isInspectingSite.value = true
+            val res = repository.inspectSiteUrl(rawUrl)
+            _latestInspectionReport.value = res.getOrNull()
+            _isInspectingSite.value = false
+            if (res.isFailure) {
+                showToast(res.exceptionOrNull()?.message ?: "تعذّر فحص الموقع")
+            }
+        }
+    }
+
+    fun clearInspectionReport() {
+        _latestInspectionReport.value = null
+    }
+
+    fun runFullSourceTest(sourceId: String) {
+        viewModelScope.launch {
+            _isRunningFullTest.value = true
+            val res = repository.runFullSourceTest(sourceId)
+            res.getOrNull()?.let { report ->
+                _fullTestReports.value = _fullTestReports.value + (sourceId to report)
+                showToast("اكتمل الاختبار الشامل: ${report.passedCount}/${report.stages.size} مراحل ناجحة")
+            } ?: showToast(res.exceptionOrNull()?.message ?: "تعذّر إجراء الاختبار")
+            _isRunningFullTest.value = false
+        }
+    }
+
+    fun openSourceConfigEditor(sourceId: String) {
+        viewModelScope.launch {
+            val cfg = repository.getSourceConfiguration(sourceId)
+            _editingSourceConfig.value = cfg
+            _configPreviewItems.value = emptyList()
+        }
+    }
+
+    fun closeSourceConfigEditor() {
+        _editingSourceConfig.value = null
+        _configPreviewItems.value = emptyList()
+    }
+
+    fun previewSourceConfiguration(config: SourceConfiguration) {
+        viewModelScope.launch {
+            _isPreviewingConfig.value = true
+            val res = repository.previewSourceConfiguration(config)
+            _configPreviewItems.value = res.getOrDefault(emptyList())
+            _isPreviewingConfig.value = false
+            val count = _configPreviewItems.value.size
+            if (count > 0) {
+                showToast("تمت المعاينة بنجاح: استخرج $count عمل")
+            } else {
+                showToast("لم تُرجع المحددات أي أعمال، يرجى مراجعة Selectors")
+            }
+        }
+    }
+
+    fun saveSourceConfiguration(config: SourceConfiguration) {
+        viewModelScope.launch {
+            val res = repository.saveSourceConfiguration(config.sourceId, config)
+            if (res.isSuccess) {
+                _editingSourceConfig.value = null
+                _configPreviewItems.value = emptyList()
+                showToast("تم حفظ إعدادات ومحددات الموقع بنجاح")
+            } else {
+                showToast(res.exceptionOrNull()?.message ?: "تعذّر حفظ الإعدادات")
+            }
+        }
+    }
+
+    fun updateSourceMetadata(
+        sourceId: String,
+        newName: String,
+        newBaseUrl: String,
+        language: String,
+        contentRating: ContentRating,
+        engineType: SourceEngineType
+    ) {
+        viewModelScope.launch {
+            val res = repository.updateSourceMetadata(
+                sourceId = sourceId,
+                newName = newName,
+                newBaseUrl = newBaseUrl,
+                language = language,
+                contentRating = contentRating,
+                engineType = engineType
+            )
+            if (res.isSuccess) {
+                showToast("تم تحديث بيانات المصدر بنجاح")
+            } else {
+                showToast(res.exceptionOrNull()?.message ?: "تعذّر تحديث المصدر")
+            }
+        }
+    }
+
+    fun exportSourceConfigJson(sourceId: String) {
+        viewModelScope.launch {
+            _exportedConfigJson.value = repository.exportSourceConfigJson(sourceId)
+        }
+    }
+
+    fun clearExportedConfigJson() {
+        _exportedConfigJson.value = null
+    }
+
+    fun importSourceConfigJson(jsonString: String) {
+        viewModelScope.launch {
+            val res = repository.importSourceConfigJson(jsonString)
+            if (res.isSuccess) {
+                showToast("تم استيراد المصدر (${res.getOrNull()?.name}) بنجاح")
+            } else {
+                showToast(res.exceptionOrNull()?.message ?: "ملف JSON غير صالح")
+            }
+        }
+    }
+
+    // ─── 18+ ADULT CONTENT & AGE VERIFICATION ───
+    fun confirmAge18PlusAndEnableAdultContent() {
+        viewModelScope.launch {
+            preferences.confirmAge18PlusAndEnableAdultContent()
+            showToast("تم تأكيد السن القانونية وتفعيل قسم +18")
+        }
+    }
+
+    fun setAdultContentEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            preferences.updateBoolean("adultContentEnabled", enabled)
+            showToast(if (enabled) "تم تفعيل محتوى +18" else "تم إخفاء محتوى +18")
+        }
+    }
+
+    fun setBlurSensitiveCovers(enabled: Boolean) {
+        viewModelScope.launch {
+            preferences.updateBoolean("blurSensitiveCovers", enabled)
         }
     }
 

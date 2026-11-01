@@ -5,13 +5,13 @@ import java.util.Locale
 
 /**
  * Rule 3 & Rule 16: Strict domain normalization and security validation.
- * - Cleans input string
+ * - Cleans input string (including RTL copy-paste artifacts)
  * - Adds HTTPS when scheme is omitted
- * - Rejects unsafe schemes (http, javascript, file, data, ftp)
+ * - Rejects unsafe schemes (http by default unless allowHttpUpgrade=true, javascript, file, data, ftp)
  * - Rejects localhost, loopback, and private/internal IPv4/IPv6 ranges
  * - Strips paths, query parameters, and fragments, returning only the normalized domain
  */
-fun normalizeDomain(input: String): String {
+fun normalizeDomain(input: String, allowHttpUpgrade: Boolean = false): String {
     var trimmed = input
         .replace("\u200E", "")
         .replace("\u200F", "")
@@ -23,7 +23,7 @@ fun normalizeDomain(input: String): String {
         .trimEnd('/', '\\', ' ')
         .lowercase(Locale.ROOT)
 
-    // Handle cases where RTL copy-paste putsscheme at the end or prefixes with slash (e.g., /https://starzmanga.com)
+    // Handle cases where RTL copy-paste puts scheme at the end or prefixes with slash (e.g., /https://starzmanga.com)
     if (trimmed.startsWith("https:/") && !trimmed.startsWith("https://")) {
         trimmed = "https://" + trimmed.removePrefix("https:/").trimStart('/')
     }
@@ -41,9 +41,12 @@ fun normalizeDomain(input: String): String {
         }
     }
 
-    // Upgrade http:// to https:// automatically so user-pasted http links work seamlessly over HTTPS
     if (trimmed.startsWith("http://")) {
-        trimmed = "https://" + trimmed.removePrefix("http://")
+        if (allowHttpUpgrade) {
+            trimmed = "https://" + trimmed.removePrefix("http://")
+        } else {
+            throw IllegalArgumentException("الروابط غير المشفرة (HTTP) غير مسموحة. استخدم HTTPS فقط.")
+        }
     }
 
     val urlWithScheme = if (trimmed.startsWith("https://")) {
@@ -101,7 +104,7 @@ fun isInternalOrLocalAddress(host: String): Boolean {
 
 fun isSafeRedirectDestination(originalDomain: String, targetUrl: String): Boolean {
     return try {
-        val targetDomain = normalizeDomain(targetUrl)
+        val targetDomain = normalizeDomain(targetUrl, allowHttpUpgrade = true)
         targetDomain == originalDomain || targetDomain.endsWith(".$originalDomain")
     } catch (e: Exception) {
         false

@@ -22,7 +22,24 @@ data class SourceEntity(
     val isSupported: Boolean,
     val status: String = "SUPPORTED",
     val version: Int,
-    val lastCheckedAt: Long
+    val lastCheckedAt: Long,
+    val engineType: String = "MADARA",
+    val contentRating: String = "GENERAL",
+    val extractedMangaCount: Int = 0,
+    val extractedChaptersCount: Int = 0,
+    val extractedPagesCount: Int = 0,
+    val lastError: String? = null
+)
+
+@Entity(
+    tableName = "source_configurations",
+    indices = [Index(value = ["domain"], unique = true)]
+)
+data class SourceConfigEntity(
+    @PrimaryKey val sourceId: String,
+    val domain: String,
+    val configJson: String,
+    val updatedAt: Long = System.currentTimeMillis()
 )
 
 @Entity(
@@ -46,7 +63,8 @@ data class MangaEntity(
     val rating: Float? = null,
     val latestChapter: String? = null,
     val isSavedInStorage: Boolean = false,
-    val updatedAt: Long = System.currentTimeMillis()
+    val updatedAt: Long = System.currentTimeMillis(),
+    val contentRating: String = "GENERAL"
 )
 
 @Entity(

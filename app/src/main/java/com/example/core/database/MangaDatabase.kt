@@ -10,6 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 @Database(
     entities = [
         SourceEntity::class,
+        SourceConfigEntity::class,
         MangaEntity::class,
         ChapterEntity::class,
         PageEntity::class,
@@ -17,7 +18,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ReadingHistoryEntity::class,
         DownloadTaskEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class MangaDatabase : RoomDatabase() {
@@ -29,9 +30,26 @@ abstract class MangaDatabase : RoomDatabase() {
 
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
-                // Safe schema evolution example preserving user data (Rule 18)
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_chapters_mangaId` ON `chapters` (`mangaId`)"
+                )
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `sources` ADD COLUMN `engineType` TEXT NOT NULL DEFAULT 'MADARA'")
+                db.execSQL("ALTER TABLE `sources` ADD COLUMN `contentRating` TEXT NOT NULL DEFAULT 'GENERAL'")
+                db.execSQL("ALTER TABLE `sources` ADD COLUMN `extractedMangaCount` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `sources` ADD COLUMN `extractedChaptersCount` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `sources` ADD COLUMN `extractedPagesCount` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `sources` ADD COLUMN `lastError` TEXT")
+                db.execSQL("ALTER TABLE `manga` ADD COLUMN `contentRating` TEXT NOT NULL DEFAULT 'GENERAL'")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `source_configurations` (`sourceId` TEXT NOT NULL, `domain` TEXT NOT NULL, `configJson` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`sourceId`))"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_source_configurations_domain` ON `source_configurations` (`domain`)"
                 )
             }
         }
@@ -43,7 +61,7 @@ abstract class MangaDatabase : RoomDatabase() {
                     MangaDatabase::class.java,
                     "manga_reader.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }

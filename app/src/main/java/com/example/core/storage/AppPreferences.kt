@@ -44,7 +44,11 @@ data class UserSettings(
     val maxConcurrentDownloads: Int = 4,
     val downloadWifiOnly: Boolean = false,
     val gridDisplayMode: GridDisplayMode = GridDisplayMode.MEDIUM,
-    val favoriteCategoriesCsv: String = "الكل,قراءة الآن,قراءة لاحقاً"
+    val favoriteCategoriesCsv: String = "الكل,قراءة الآن,قراءة لاحقاً",
+    val adultContentEnabled: Boolean = false,
+    val ageVerified18Plus: Boolean = false,
+    val blurSensitiveCovers: Boolean = true,
+    val allowMatureContent: Boolean = true
 )
 
 class AppPreferences(private val context: Context) {
@@ -80,6 +84,10 @@ class AppPreferences(private val context: Context) {
         val FAVORITE_CATEGORIES = stringPreferencesKey("favorite_categories")
         val VERIFICATION_SESSIONS_METADATA = stringPreferencesKey("verification_sessions_metadata")
         val INITIAL_SOURCES_CLEARED_V2 = booleanPreferencesKey("initial_sources_cleared_v2")
+        val ADULT_CONTENT_ENABLED = booleanPreferencesKey("adult_content_enabled")
+        val AGE_VERIFIED_18_PLUS = booleanPreferencesKey("age_verified_18_plus")
+        val BLUR_SENSITIVE_COVERS = booleanPreferencesKey("blur_sensitive_covers")
+        val ALLOW_MATURE_CONTENT = booleanPreferencesKey("allow_mature_content")
     }
 
     val initialSourcesClearedFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
@@ -137,7 +145,11 @@ class AppPreferences(private val context: Context) {
             gridDisplayMode = prefs[Keys.GRID_DISPLAY_MODE]?.let {
                 runCatching { GridDisplayMode.valueOf(it) }.getOrNull()
             } ?: GridDisplayMode.MEDIUM,
-            favoriteCategoriesCsv = prefs[Keys.FAVORITE_CATEGORIES] ?: "الكل,قراءة الآن,قراءة لاحقاً"
+            favoriteCategoriesCsv = prefs[Keys.FAVORITE_CATEGORIES] ?: "الكل,قراءة الآن,قراءة لاحقاً",
+            adultContentEnabled = prefs[Keys.ADULT_CONTENT_ENABLED] ?: false,
+            ageVerified18Plus = prefs[Keys.AGE_VERIFIED_18_PLUS] ?: false,
+            blurSensitiveCovers = prefs[Keys.BLUR_SENSITIVE_COVERS] ?: true,
+            allowMatureContent = prefs[Keys.ALLOW_MATURE_CONTENT] ?: true
         )
     }
 
@@ -155,6 +167,13 @@ class AppPreferences(private val context: Context) {
 
     suspend fun setGridDisplayMode(mode: GridDisplayMode) {
         context.dataStore.edit { it[Keys.GRID_DISPLAY_MODE] = mode.name }
+    }
+
+    suspend fun confirmAge18PlusAndEnableAdultContent() {
+        context.dataStore.edit {
+            it[Keys.AGE_VERIFIED_18_PLUS] = true
+            it[Keys.ADULT_CONTENT_ENABLED] = true
+        }
     }
 
     suspend fun updateBoolean(keyName: String, value: Boolean) {
@@ -179,6 +198,10 @@ class AppPreferences(private val context: Context) {
             "checkNewChapters" -> Keys.CHECK_NEW_CHAPTERS
             "checkNewChaptersWifiOnly" -> Keys.CHECK_NEW_WIFI_ONLY
             "downloadWifiOnly" -> Keys.DOWNLOAD_WIFI_ONLY
+            "adultContentEnabled" -> Keys.ADULT_CONTENT_ENABLED
+            "ageVerified18Plus" -> Keys.AGE_VERIFIED_18_PLUS
+            "blurSensitiveCovers" -> Keys.BLUR_SENSITIVE_COVERS
+            "allowMatureContent" -> Keys.ALLOW_MATURE_CONTENT
             else -> return
         }
         context.dataStore.edit { it[key] = value }
