@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - master
   pull_request:
     branches:
       - main
+      - master
   workflow_dispatch:
 
 permissions:
@@ -36,18 +38,52 @@ jobs:
           yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-36" "platforms;android-36.1" "build-tools;36.0.0" || true
 
-      - name: Setup Gradle with Cache
+      - name: Setup Gradle 9.3.1 with Cache
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: wrapper
+          gradle-version: '9.3.1'
 
-      - name: Prepare Environment & Standard Debug Keystore
+      - name: Prepare Environment, Wrapper, Fonts & Standard Debug Keystore
         run: |
-          # Ensure .env exists from template so Secrets Gradle Plugin succeeds without secrets
+          # 1. Ensure Gradle Wrapper JAR exists even if binary files were skipped during push
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper
+          fi
+          chmod +x ./gradlew
+
+          # 2. Ensure .env exists from template so Secrets Gradle Plugin succeeds without secrets
           if [ ! -f .env ] && [ -f .env.example ]; then
             cp .env.example .env
           fi
-          # Generate standard Android debug.keystore expected by debugConfig in app/build.gradle.kts
+
+          # 3. Ensure Cairo font resource exists if binary font was skipped during push
+          mkdir -p app/src/main/res/font
+          if [ ! -s app/src/main/res/font/cairo.ttf ]; then
+            curl -L -s "https://fonts.gstatic.com/s/cairo/v31/SLXgc1nY6HkvangtZmpQdkhzfH5lkSs2SgRjCAGMQ1z0hOA-a1PiKQ.ttf" -o app/src/main/res/font/cairo.ttf
+          fi
+
+          # 4. Ensure mipmap PNG launcher icons exist and are valid PNGs
+          if [ ! -s app/src/main/res/mipmap-mdpi/ic_launcher.png ]; then
+            SRC="/tmp/icon.png"
+            convert -size 288x288 gradient:'#1E1B4B-#312E81' -fill '#818CF8' \
+              -draw "affine 8,0,0,8,48,48 path 'M18,2H6C4.9,2 4,2.9 4,4v16c0,1.1 0.9,2 2,2h12c1.1,0 2,-0.9 2,-2V4C20,2.9 19.1,2 18,2zM9,4h2v5l-1,-0.75L9,9V4zM18,20H6V4h1v9l3,-2.25L13,13V4h5V20z'" "PNG32:$SRC"
+            BASE="app/src/main/res"
+            for spec in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              dir="$BASE/mipmap-${spec%:*}"
+              size="${spec#*:}"
+              mkdir -p "$dir"
+              convert "$SRC" -resize "${size}x${size}!" "PNG32:$dir/ic_launcher.png"
+              rm -f "$dir/ic_launcher.webp"
+              radius=$((size / 2))
+              convert "$SRC" -resize "${size}x${size}!" \
+                \( -size "${size}x${size}" xc:none -fill white \
+                   -draw "circle $radius,$radius $radius,0" \) \
+                -alpha set -compose DstIn -composite "PNG32:$dir/ic_launcher_round.png"
+              rm -f "$dir/ic_launcher_round.webp"
+            done
+          fi
+
+          # 5. Generate standard Android debug.keystore expected by debugConfig in app/build.gradle.kts
           if [ ! -f debug.keystore ]; then
             keytool -genkeypair -v \
               -keystore debug.keystore \
@@ -59,9 +95,6 @@ jobs:
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
-
-      - name: Grant Execute Permission for Gradle Wrapper
-        run: chmod +x ./gradlew
 
       - name: Run Unit & Robolectric Tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
