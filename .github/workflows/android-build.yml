@@ -34,7 +34,7 @@ jobs:
       - name: Accept Android SDK Licenses & Install Required SDK Platform
         run: |
           yes | sdkmanager --licenses || true
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" || true
+          sdkmanager "platform-tools" "platforms;android-36" "platforms;android-36.1" "build-tools;36.0.0" || true
 
       - name: Setup Gradle with Cache
         uses: gradle/actions/setup-gradle@v4

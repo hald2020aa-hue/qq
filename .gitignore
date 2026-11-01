@@ -16,6 +16,8 @@ local.properties
 .externalNativeBuild
 .cxx
 .build-outputs
+/public
+*.mp4
 
 # Secrets & Environment Variables (Never commit real keys)
 .env
@@ -28,6 +30,3 @@ debug.keystore.base64
 
 # Ensure Gradle Wrapper JAR is not ignored
 !gradle/wrapper/gradle-wrapper.jar
-
-# AI Studio screen recordings
-public/assets/aistudio/Screen_Recording*.mp4
