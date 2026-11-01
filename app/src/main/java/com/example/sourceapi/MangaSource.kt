@@ -6,8 +6,8 @@ import com.example.domain.models.MangaDetails
 import com.example.domain.models.MangaPage
 import com.example.domain.models.MangaSummary
 import com.example.domain.models.PageResult
-import com.example.domain.models.SourceInfo
 import com.example.domain.models.SourceStatus
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -35,9 +35,9 @@ interface MangaSource {
 }
 
 /**
- * Section 8: Multi-attribute HTML Image Extractor using Jsoup.
- * Supports: src, data-src, data-lazy-src, data-original, srcset.
- * Resolves relative URLs against baseUri and preserves page order.
+ * Section 8: Multi-attribute HTML Image Extractor using Jsoup & OkHttp HttpUrl.
+ * Supports: src, data-src, data-lazy-src, data-original, data-bg, srcset, data-srcset, and inline style background-image.
+ * Properly encodes Arabic characters and spaces in relative/absolute URLs so covers never fail with URISyntaxException.
  */
 object HtmlImageExtractor {
 
@@ -45,23 +45,29 @@ object HtmlImageExtractor {
         "data-src",
         "data-lazy-src",
         "data-original",
+        "data-bg",
+        "data-srcset",
         "srcset",
         "src"
     )
 
+    private val BG_URL_REGEX = Regex("""url\(['"]?([^'")]+)['"]?\)""")
+
     fun extractImageUrl(element: Element?, baseUri: String): String? {
         if (element == null) return null
+
+        // 1. Check standard and lazy-loading attributes on the element or child <img>
+        val target = if (element.tagName().equals("img", ignoreCase = true)) {
+            element
+        } else {
+            element.selectFirst("img") ?: element
+        }
+
         for (attr in IMAGE_ATTRIBUTES) {
-            val raw = element.attr(attr).trim()
-            if (raw.isNotEmpty() && !raw.startsWith("data:image/svg") && !raw.startsWith("data:image/gif")) {
-                val candidate = if (attr == "srcset") {
-                    raw.split(',')
-                        .firstOrNull()
-                        ?.trim()
-                        ?.split(' ')
-                        ?.firstOrNull()
-                        ?.trim()
-                        .orEmpty()
+            val raw = target.attr(attr).trim()
+            if (isValidRawImageCandidate(raw)) {
+                val candidate = if (attr.endsWith("srcset")) {
+                    parseFirstUrlFromSrcset(raw)
                 } else {
                     raw
                 }
@@ -69,10 +75,57 @@ object HtmlImageExtractor {
                 if (resolved != null) return resolved
             }
         }
+
+        // 2. Check inline style="background-image: url(...)" on element or children
+        val styledEl = if (element.attr("style").contains("url(")) {
+            element
+        } else {
+            element.selectFirst("[style*=url(]")
+        }
+        if (styledEl != null) {
+            val match = BG_URL_REGEX.find(styledEl.attr("style"))
+            val bgUrl = match?.groupValues?.getOrNull(1)?.trim().orEmpty()
+            if (isValidRawImageCandidate(bgUrl)) {
+                val resolved = resolveUrl(baseUri, bgUrl)
+                if (resolved != null) return resolved
+            }
+        }
+
         return null
     }
 
-    fun extractChapterPagesFromHtml(html: String, baseUri: String, selector: String = ".reading-content img, .page-break img, .chapter-content img, img.wp-manga-chapter-img"): List<MangaPage> {
+    private fun isValidRawImageCandidate(raw: String): Boolean {
+        if (raw.isBlank()) return false
+        val lower = raw.lowercase()
+        if (lower.startsWith("data:image/svg") ||
+            lower.startsWith("data:image/gif") ||
+            lower.contains("blank.gif") ||
+            lower.contains("placeholder") ||
+            lower.startsWith("javascript:")
+        ) {
+            return false
+        }
+        return true
+    }
+
+    private fun parseFirstUrlFromSrcset(srcset: String): String {
+        return srcset
+            .lines()
+            .joinToString(" ")
+            .split(',')
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?.split(Regex("\\s+"))
+            ?.firstOrNull()
+            ?.trim()
+            .orEmpty()
+    }
+
+    fun extractChapterPagesFromHtml(
+        html: String,
+        baseUri: String,
+        selector: String = ".reading-content img, .page-break img, .chapter-content img, #readerarea img, img.wp-manga-chapter-img"
+    ): List<MangaPage> {
         val doc: Document = Jsoup.parse(html, baseUri)
         val elements = doc.select(selector)
         val urls = mutableListOf<String>()
@@ -98,15 +151,43 @@ object HtmlImageExtractor {
             )
     }
 
+    /**
+     * Resolves relative, protocol-relative, and unencoded Arabic/space URLs against baseUri
+     * and normalizes http:// to https://.
+     */
     fun resolveUrl(baseUri: String, relativeOrAbsolute: String): String? {
-        val clean = relativeOrAbsolute.trim()
+        val clean = relativeOrAbsolute
+            .trim()
+            .replace("\n", "")
+            .replace("\r", "")
+            .trim()
         if (clean.isEmpty()) return null
+
+        val normalizedBase = if (baseUri.startsWith("http://")) {
+            "https://" + baseUri.removePrefix("http://")
+        } else if (!baseUri.startsWith("https://")) {
+            "https://$baseUri"
+        } else {
+            baseUri
+        }
+
+        // First try OkHttp's WHATWG/RFC-compliant HttpUrl resolver (handles Arabic & spaces gracefully)
+        val baseHttpUrl = normalizedBase.toHttpUrlOrNull()
+        if (baseHttpUrl != null) {
+            val resolvedHttpUrl = baseHttpUrl.resolve(clean)
+            if (resolvedHttpUrl != null) {
+                return resolvedHttpUrl.newBuilder().scheme("https").build().toString()
+            }
+        }
+
+        // Fallback URI resolution with space encoding
         return try {
+            val safeClean = clean.replace(" ", "%20")
             when {
-                clean.startsWith("https://") -> clean
-                clean.startsWith("//") -> "https:$clean"
-                clean.startsWith("http://") -> "https://" + clean.removePrefix("http://")
-                else -> URI(baseUri).resolve(clean).toString()
+                safeClean.startsWith("https://") -> safeClean
+                safeClean.startsWith("//") -> "https:$safeClean"
+                safeClean.startsWith("http://") -> "https://" + safeClean.removePrefix("http://")
+                else -> URI(normalizedBase).resolve(safeClean).toString()
             }
         } catch (e: Exception) {
             null
@@ -190,7 +271,6 @@ class SourceValidator(private val registry: SourceRegistry) {
             )
         }
 
-        // Rule 20: Test Popular, Details, and Chapters before declaring SUPPORTED
         return try {
             val popular = connector.getPopular(1)
             val firstWork = popular.items.firstOrNull()

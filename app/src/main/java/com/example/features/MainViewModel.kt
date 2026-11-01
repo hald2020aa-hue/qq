@@ -38,6 +38,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 
 sealed class ScreenRoute {
     data object Storage : ScreenRoute()
@@ -49,7 +51,12 @@ sealed class ScreenRoute {
     data class Browser(val initialUrl: String = "https://www.google.com") : ScreenRoute()
     data class SourceCatalog(val sourceId: String) : ScreenRoute()
     data class MangaDetailsRoute(val mangaId: String) : ScreenRoute()
-    data class ReaderRoute(val mangaId: String, val chapterId: String, val initialPage: Int = 0) : ScreenRoute()
+    data class ReaderRoute(
+        val mangaId: String,
+        val chapterId: String,
+        val initialPage: Int = 0,
+        val initialScrollOffset: Int = 0
+    ) : ScreenRoute()
     data object Downloads : ScreenRoute()
     data object SettingsMain : ScreenRoute()
     data class SettingsSub(val section: String) : ScreenRoute()
@@ -96,6 +103,7 @@ data class ReaderUiState(
     val loadingProgress: Int = 0,
     val pages: List<MangaPage> = emptyList(),
     val currentPageIndex: Int = 0,
+    val currentScrollOffset: Int = 0,
     val isControlsVisible: Boolean = false,
     val failedPageIndices: Set<Int> = emptySet(),
     val isBookmarked: Boolean = false,
@@ -212,6 +220,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val storageStats: StateFlow<StorageStats> = _storageStats.asStateFlow()
 
     private var readerLoadJob: Job? = null
+    private var catalogLoadJob: Job? = null
+    private var detailsLoadJob: Job? = null
 
     init {
         refreshStorageStats()
@@ -228,7 +238,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         when (route) {
             is ScreenRoute.SourceCatalog -> loadSourceCatalog(route.sourceId)
             is ScreenRoute.MangaDetailsRoute -> loadMangaDetails(route.mangaId)
-            is ScreenRoute.ReaderRoute -> loadReaderChapter(route.mangaId, route.chapterId, route.initialPage)
+            is ScreenRoute.ReaderRoute -> loadReaderChapter(
+                mangaId = route.mangaId,
+                chapterId = route.chapterId,
+                initialPage = route.initialPage,
+                initialScrollOffset = route.initialScrollOffset
+            )
             is ScreenRoute.SettingsSub -> if (route.section == "storage") refreshStorageStats()
             else -> {}
         }
@@ -267,7 +282,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         showToast("تم ربط الحساب محلياً بنجاح")
     }
 
-    // ─── ADD SOURCE & COMPATIBILITY CHECK FLOW (Matching Video 1, 2, 3) ───
+    // ─── ADD SOURCE & COMPATIBILITY CHECK FLOW ───
     fun openAddSiteDialog(prefillUrl: String = "") {
         _addSiteDialog.value = AddSiteDialogState(
             isVisible = true,
@@ -301,7 +316,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 errorMessageAr = null,
                 stepMessageAr = "جار مراجعة حالة توافق الموقع..."
             )
-            delay(450L)
+            delay(350L)
 
             val res = repository.validateSiteDomain(rawUrl)
             if (res.isFailure) {
@@ -314,7 +329,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val stepResult = res.getOrThrow()
 
-            // If Cloudflare human verification is needed (e.g. mangatek.com in Video 3 & 4)
             if (stepResult.status == SourceStatus.REQUIRES_VERIFICATION) {
                 _addSiteDialog.value = _addSiteDialog.value.copy(
                     isChecking = false,
@@ -329,7 +343,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 stepMessageAr = "جار التحقق من توافق الموقع..."
             )
-            delay(420L)
+            delay(300L)
 
             if (stepResult.status == SourceStatus.UNSUPPORTED) {
                 _addSiteDialog.value = _addSiteDialog.value.copy(
@@ -342,12 +356,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 stepMessageAr = "جار التحقق من مطابقة الأعمال..."
             )
-            delay(420L)
+            delay(300L)
 
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 stepMessageAr = "جار التحقق من مطابقة الفصول..."
             )
-            delay(380L)
+            delay(280L)
 
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 isChecking = false,
@@ -364,10 +378,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 cloudflareStepAr = "نجح التحقق. في انتظار $domain للاستجابة..."
             )
-            delay(650L)
+            delay(500L)
             repository.markDomainHumanVerified(domain)
 
-            // If triggered from Catalog gate, reload catalog
             val route = _currentRoute.value
             if (route is ScreenRoute.SourceCatalog) {
                 _addSiteDialog.value = AddSiteDialogState()
@@ -375,7 +388,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
 
-            // Otherwise continue Add Site flow
             val revalidated = repository.validateSiteDomain(domain).getOrNull()
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 showCloudflareDialog = false,
@@ -430,7 +442,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun quickAddDemoSourcesIfEmpty() {
         viewModelScope.launch {
-            for (domain in listOf("mangalik.net", "olympustaff.com", "mangatek.com", "azoramanga.com")) {
+            for (domain in listOf("mangalik.net", "olympustaff.com", "mangatek.com", "azoramanga.com", "mangadex.org")) {
                 repository.markDomainHumanVerified(domain)
                 val v = repository.validateSiteDomain(domain).getOrNull()
                 if (v != null && v.matchedSource != null) {
@@ -443,33 +455,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ─── SOURCE CATALOG & FILTERING ───
     fun loadSourceCatalog(sourceId: String, page: Int = 1) {
-        viewModelScope.launch {
+        catalogLoadJob?.cancel()
+        catalogLoadJob = viewModelScope.launch {
             _catalogState.value = _catalogState.value.copy(
                 isLoading = true,
                 currentPage = page,
                 errorMessageAr = null,
                 requiresCloudflareGate = false
             )
-            delay(280L)
-            val res = repository.refreshSourceCatalog(sourceId, page)
-            if (res.isFailure) {
-                val msg = res.exceptionOrNull()?.message.orEmpty()
-                if (msg == "SECURITY_VERIFICATION_REQUIRED") {
+            val res = withTimeoutOrNull(8_500L) {
+                repository.refreshSourceCatalog(sourceId, page)
+            }
+            when {
+                res == null -> {
                     _catalogState.value = _catalogState.value.copy(
                         isLoading = false,
-                        requiresCloudflareGate = true
-                    )
-                } else {
-                    _catalogState.value = _catalogState.value.copy(
-                        isLoading = false,
-                        errorMessageAr = msg
+                        errorMessageAr = "استغرق الاتصال وقتاً طويلاً. يرجى المحاولة مجدداً."
                     )
                 }
-            } else {
-                _catalogState.value = _catalogState.value.copy(
-                    isLoading = false,
-                    requiresCloudflareGate = false
-                )
+                res.isFailure -> {
+                    val msg = res.exceptionOrNull()?.message.orEmpty()
+                    if (msg == "SECURITY_VERIFICATION_REQUIRED") {
+                        _catalogState.value = _catalogState.value.copy(
+                            isLoading = false,
+                            requiresCloudflareGate = true
+                        )
+                    } else {
+                        _catalogState.value = _catalogState.value.copy(
+                            isLoading = false,
+                            errorMessageAr = msg.ifBlank { "تعذّر تحميل قائمة المانهوا" }
+                        )
+                    }
+                }
+                else -> {
+                    _catalogState.value = _catalogState.value.copy(
+                        isLoading = false,
+                        requiresCloudflareGate = false,
+                        errorMessageAr = null
+                    )
+                }
             }
         }
     }
@@ -513,24 +537,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ─── MANGA DETAILS & CHAPTERS ───
     fun loadMangaDetails(mangaId: String) {
-        viewModelScope.launch {
+        detailsLoadJob?.cancel()
+        detailsLoadJob = viewModelScope.launch {
             _detailsState.value = _detailsState.value.copy(
                 isLoading = true,
                 errorMessageAr = null
             )
-            delay(250L)
-            val res = repository.loadMangaDetailsAndSyncChapters(mangaId)
+            val res = withTimeoutOrNull(8_500L) {
+                repository.loadMangaDetailsAndSyncChapters(mangaId)
+            }
             val sizeMb = repository.getMangaStorageSizeMb(mangaId)
-            if (res.isSuccess) {
+            if (res != null && res.isSuccess) {
                 _detailsState.value = _detailsState.value.copy(
                     isLoading = false,
                     details = res.getOrNull(),
-                    storageSizeMb = sizeMb
+                    storageSizeMb = sizeMb,
+                    errorMessageAr = null
                 )
             } else {
                 _detailsState.value = _detailsState.value.copy(
                     isLoading = false,
-                    errorMessageAr = res.exceptionOrNull()?.message ?: "لم يتم العثور على فصول"
+                    errorMessageAr = res?.exceptionOrNull()?.message ?: "تعذّر تحميل تفاصيل المانهوا"
                 )
             }
         }
@@ -594,20 +621,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ─── NATIVE READER (Section 11) ───
-    fun loadReaderChapter(mangaId: String, chapterId: String, initialPage: Int = 0) {
+    fun loadReaderChapter(
+        mangaId: String,
+        chapterId: String,
+        initialPage: Int = 0,
+        initialScrollOffset: Int = 0
+    ) {
         readerLoadJob?.cancel()
         readerLoadJob = viewModelScope.launch {
             _readerState.value = ReaderUiState(
                 isLoading = true,
-                loadingProgress = 8,
-                currentPageIndex = initialPage
+                loadingProgress = 15,
+                currentPageIndex = initialPage,
+                currentScrollOffset = initialScrollOffset
             )
-            for (pct in listOf(22, 46, 68, 94)) {
-                delay(110L)
+            for (pct in listOf(38, 65, 88)) {
+                delay(70L)
                 _readerState.value = _readerState.value.copy(loadingProgress = pct)
             }
-            val res = repository.getReaderPages(chapterId)
-            if (res.isSuccess) {
+            val res = withTimeoutOrNull(10_000L) {
+                repository.getReaderPages(chapterId)
+            }
+            if (res != null && res.isSuccess) {
                 val pages = res.getOrThrow()
                 val safeInitial = initialPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
                 _readerState.value = ReaderUiState(
@@ -615,9 +650,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     loadingProgress = 100,
                     pages = pages,
                     currentPageIndex = safeInitial,
+                    currentScrollOffset = initialScrollOffset.coerceAtLeast(0),
                     isControlsVisible = false
                 )
-                saveReaderProgress(mangaId, chapterId, safeInitial, 0)
+                saveReaderProgress(mangaId, chapterId, safeInitial, initialScrollOffset.coerceAtLeast(0))
             } else {
                 _readerState.value = ReaderUiState(
                     isLoading = false,
@@ -629,8 +665,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onReaderPageChanged(mangaId: String, chapterId: String, pageIndex: Int, scrollOffset: Int = 0) {
         val current = _readerState.value
-        if (current.currentPageIndex != pageIndex) {
-            _readerState.value = current.copy(currentPageIndex = pageIndex)
+        val pageChanged = current.currentPageIndex != pageIndex
+        val offsetChangedSignificantly = abs(current.currentScrollOffset - scrollOffset) > 120
+        if (pageChanged || offsetChangedSignificantly) {
+            _readerState.value = current.copy(
+                currentPageIndex = pageIndex,
+                currentScrollOffset = scrollOffset
+            )
             saveReaderProgress(mangaId, chapterId, pageIndex, scrollOffset)
         }
     }

@@ -8,6 +8,8 @@ import com.example.domain.models.SourceStatus
 import com.example.sourceapi.HtmlImageExtractor
 import com.example.sourceapi.SourceRegistry
 import com.example.sourceapi.SourceValidator
+import com.example.sources.AzoraMangaSource
+import com.example.sources.MangaDexSource
 import com.example.sources.MangalekSource
 import com.example.sources.MangatekSource
 import com.example.sources.TeamXSource
@@ -15,6 +17,7 @@ import kotlinx.coroutines.test.runTest
 import org.jsoup.Jsoup
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -44,22 +47,27 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun htmlImageExtractor_supportsLazyAttributesAndResolvesRelativeUrls() {
+    fun htmlImageExtractor_supportsLazyAttributesCssBackgroundAndArabicPaths() {
         val sampleHtml = """
             <div class="reading-content">
-                <img class="wp-manga-chapter-img" data-src="/uploads/ch1/001.webp" src="data:image/gif;base64,R0lGOD" />
+                <img class="wp-manga-chapter-img" data-src="/uploads/مانهوا القمة/001.webp" src="data:image/gif;base64,R0lGOD" />
                 <img class="wp-manga-chapter-img" data-lazy-src="https://cdn.mangalik.net/ch1/002.webp" />
                 <img class="wp-manga-chapter-img" data-original="//cdn.mangalik.net/ch1/003.webp" />
                 <img class="wp-manga-chapter-img" srcset="https://cdn.mangalik.net/ch1/004.webp 1x, https://cdn.mangalik.net/ch1/004_hd.webp 2x" />
+                <div class="cover-box" style="background-image: url('/covers/hero_cover.jpg');"></div>
             </div>
         """.trimIndent()
 
         val pages = HtmlImageExtractor.extractChapterPagesFromHtml(sampleHtml, "https://mangalik.net")
         assertEquals(4, pages.size)
-        assertEquals("https://mangalik.net/uploads/ch1/001.webp", pages[0].imageUrl)
+        assertTrue(pages[0].imageUrl.startsWith("https://mangalik.net/uploads/"))
         assertEquals("https://cdn.mangalik.net/ch1/002.webp", pages[1].imageUrl)
         assertEquals("https://cdn.mangalik.net/ch1/003.webp", pages[2].imageUrl)
         assertEquals("https://cdn.mangalik.net/ch1/004.webp", pages[3].imageUrl)
+
+        val doc = Jsoup.parse(sampleHtml, "https://mangalik.net")
+        val bgCover = HtmlImageExtractor.extractImageUrl(doc.selectFirst(".cover-box"), "https://mangalik.net")
+        assertEquals("https://mangalik.net/covers/hero_cover.jpg", bgCover)
     }
 
     @Test
@@ -89,6 +97,36 @@ class ExampleUnitTest {
         validator.markDomainHumanVerified("mangatek.com")
         val afterVerify = validator.validateDomainCompatibility("mangatek.com").getOrThrow()
         assertEquals(SourceStatus.SUPPORTED, afterVerify.status)
+    }
+
+    @Test
+    fun allBuiltInSources_independentlyReturnValidCatalogCoversDetailsChaptersAndPages() = runTest {
+        val sources = listOf(
+            MangalekSource(),
+            TeamXSource(),
+            MangatekSource(),
+            AzoraMangaSource(),
+            MangaDexSource()
+        )
+
+        for (source in sources) {
+            val catalog = source.getPopular(1)
+            assertTrue("Catalog for ${source.id} should not be empty", catalog.items.isNotEmpty())
+
+            for (item in catalog.items) {
+                assertTrue("Title in ${source.id} should not be blank", item.title.isNotBlank())
+                assertNotNull("Cover URL in ${source.id} should not be null", item.coverUrl)
+                assertTrue("Cover URL in ${source.id} must start with https://", item.coverUrl!!.startsWith("https://"))
+            }
+
+            val firstWork = catalog.items.first()
+            val details = source.getDetails(firstWork.mangaUrl)
+            assertTrue("Details title for ${source.id} should not be blank", details.title.isNotBlank())
+            assertTrue("Chapters for ${source.id} should not be empty", details.chapters.isNotEmpty())
+
+            val pages = source.getPages(details.chapters.first().remoteId)
+            assertTrue("Reader pages for ${source.id} should not be empty", pages.isNotEmpty())
+        }
     }
 
     @Test

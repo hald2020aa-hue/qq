@@ -44,17 +44,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import coil.compose.SubcomposeAsyncImage
+import com.example.core.images.MangaCoverImage
 import com.example.domain.models.DownloadStatus
 import com.example.domain.models.DownloadTask
 import java.util.Locale
 
-/**
- * Section 12 & Video 2 (02:40 - 03:08 & 07:16 - 08:01):
- * Downloads screen showing active tasks ("قيد التنفيذ") with progress percentage, remaining time,
- * Pause ("إيقاف") and Cancel ("إلغاء") buttons, global Pause/Resume toggle in header,
- * and completed/cancelled tasks under "الآن" / "اليوم".
- */
 @Composable
 fun DownloadsScreen(
     tasks: List<DownloadTask>,
@@ -85,7 +79,6 @@ fun DownloadsScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Top Header matching Video 2 (07:16): Back arrow + "التنزيلات" on right, "إيقاف ||" + 3-dot on left
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -225,12 +218,12 @@ private fun ActiveDownloadCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                SubcomposeAsyncImage(
-                    model = task.coverUrl,
-                    contentDescription = task.mangaTitle,
+                MangaCoverImage(
+                    imageUrl = task.coverUrl,
+                    title = task.mangaTitle,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
-                        .size(54.dp, 72.dp)
+                        .size(54.dp, 76.dp)
                         .clip(RoundedCornerShape(8.dp))
                 )
                 Spacer(modifier = Modifier.width(12.dp))
@@ -248,12 +241,12 @@ private fun ActiveDownloadCard(
                     ) {
                         Column {
                             Text(
-                                text = if (task.status == DownloadStatus.PAUSED) "موقوف مؤقتاً" else "جار التنزيل...",
+                                text = if (task.status == DownloadStatus.PAUSED) "موقوف مؤقتاً • ${task.chapterTitle}" else "جار التنزيل • ${task.chapterTitle}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
-                                text = if (task.status == DownloadStatus.PAUSED) "عالقة" else "خلال ${task.remainingSecondsEstimate} ثانية",
+                                text = if (task.status == DownloadStatus.PAUSED) "عالقة (${task.downloadedPages}/${task.totalPages})" else "خلال ${task.remainingSecondsEstimate} ثانية (${task.downloadedPages}/${task.totalPages})",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -318,7 +311,6 @@ private fun FinishedDownloadCard(
     onClick: () -> Unit,
     onRetry: () -> Unit
 ) {
-    // Matches Video 2 (08:00): "اكتمل التنزيل / فصل واحد" or "ألغيت"
     Card(
         onClick = onClick,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -336,12 +328,12 @@ private fun FinishedDownloadCard(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.weight(1f)
             ) {
-                SubcomposeAsyncImage(
-                    model = task.coverUrl,
-                    contentDescription = task.mangaTitle,
+                MangaCoverImage(
+                    imageUrl = task.coverUrl,
+                    title = task.mangaTitle,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
-                        .size(50.dp, 68.dp)
+                        .size(50.dp, 70.dp)
                         .clip(RoundedCornerShape(8.dp))
                 )
                 Spacer(modifier = Modifier.width(12.dp))
@@ -354,9 +346,9 @@ private fun FinishedDownloadCard(
                     )
                     Text(
                         text = when (task.status) {
-                            DownloadStatus.COMPLETED -> "اكتمل التنزيل • ${task.chapterTitle}"
-                            DownloadStatus.CANCELLED -> "ألغيت"
-                            else -> "فشل التنزيل"
+                            DownloadStatus.COMPLETED -> "اكتمل التنزيل • ${task.chapterTitle} (${task.totalPages} صفحة)"
+                            DownloadStatus.CANCELLED -> "ألغيت • ${task.chapterTitle}"
+                            else -> "فشل التنزيل • ${task.chapterTitle}"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant

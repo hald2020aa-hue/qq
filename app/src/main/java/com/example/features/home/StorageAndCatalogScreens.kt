@@ -26,7 +26,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BrokenImage
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteSweep
@@ -50,6 +49,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -66,7 +66,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
@@ -75,9 +74,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil.compose.SubcomposeAsyncImage
 import com.example.core.database.FavoriteEntity
 import com.example.core.database.ReadingHistoryEntity
+import com.example.core.images.MangaCoverImage
 import com.example.domain.models.GridDisplayMode
 import com.example.domain.models.MangaSummary
 import com.example.domain.models.SortOption
@@ -109,7 +108,6 @@ fun StorageHomeScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Top App Bar matching Video 1 & 2 (Menu on right in RTL, Search + 3-dot on left)
         Surface(
             color = MaterialTheme.colorScheme.background,
             modifier = Modifier.fillMaxWidth()
@@ -273,7 +271,6 @@ fun StorageHomeScreen(
         }
 
         if (filtered.isEmpty()) {
-            // Exact Kaomoji Empty State from Video 1 & 2: (`o´) / (-_-) + "لم تحفظ اي عمل في التخزين." + "استيراد"
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -360,7 +357,7 @@ fun SourceCatalogScreen(
         catalogState.selectedSort,
         catalogState.selectedStatus
     ) {
-        var list = mangaItems
+        var list = mangaItems.filter { it.title.isNotBlank() && it.mangaUrl.isNotBlank() }
         if (catalogState.searchQuery.isNotBlank()) {
             val q = catalogState.searchQuery.trim()
             list = list.filter {
@@ -391,7 +388,6 @@ fun SourceCatalogScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Header matching Video 2, 3, 4 ("مانجا ليك Mangalek" / "مانجاتك - Mangatek")
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -399,7 +395,10 @@ fun SourceCatalogScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
                 IconButton(onClick = onOpenDrawer) {
                     Icon(Icons.Default.Menu, contentDescription = "القائمة")
                 }
@@ -486,6 +485,14 @@ fun SourceCatalogScreen(
             }
         }
 
+        // Non-blocking top progress bar when refreshing while cached items are already visible
+        if (catalogState.isLoading && filteredItems.isNotEmpty()) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+
         if (catalogState.isSearchActive) {
             OutlinedTextField(
                 value = catalogState.searchQuery,
@@ -503,7 +510,6 @@ fun SourceCatalogScreen(
             )
         }
 
-        // Filter row & Horizontal Genre Chips Bar (Matching Video 2 & 4)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -512,8 +518,8 @@ fun SourceCatalogScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "صفحة ${catalogState.currentPage}",
-                style = MaterialTheme.typography.labelSmall,
+                text = "صفحة ${catalogState.currentPage} • (${filteredItems.size} عمل)",
+                style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Row(
@@ -573,15 +579,14 @@ fun SourceCatalogScreen(
             }
         }
 
-        // Content Body: Loading / Cloudflare Verification Gate / Adaptive Grid
+        // Explicit 4-state UI handling:
+        // 1) Cloudflare Gate
+        // 2) Loading (only when no cached items yet)
+        // 3) Error (when no cached items + retry button)
+        // 4) Empty state (when filter/search returns 0 items)
+        // 5) Success Grid/List
         when {
-            catalogState.isLoading -> {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                }
-            }
             catalogState.requiresCloudflareGate && source != null -> {
-                // Exact match to Video 4 (00:05): Robot icon + "عليك فتح الصفحة وإكمال التحقق" + "فتح صفحة الموقع"
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -619,10 +624,89 @@ fun SourceCatalogScreen(
                     }
                 }
             }
+            catalogState.isLoading && filteredItems.isEmpty() -> {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "جارٍ جلب أعمال المانهوا...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            catalogState.errorMessageAr != null && filteredItems.isEmpty() -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "( ×_× )",
+                            fontSize = 42.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFB0B6C6)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = catalogState.errorMessageAr,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = { onRefreshCatalog(catalogState.currentPage) },
+                            shape = RoundedCornerShape(22.dp)
+                        ) {
+                            Text("إعادة المحاولة")
+                        }
+                    }
+                }
+            }
+            filteredItems.isEmpty() -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "( ⊙_⊙ )",
+                            fontSize = 42.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFB0B6C6)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "لا توجد أعمال مطابقة للبحث أو الفلتر المحدد.",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        OutlinedButton(
+                            onClick = {
+                                onClearFilters()
+                                onRefreshCatalog(1)
+                            },
+                            shape = RoundedCornerShape(20.dp)
+                        ) {
+                            Text("مسح الفلتر وتحديث القائمة")
+                        }
+                    }
+                }
+            }
             else -> {
                 AdaptiveMangaGridOrList(
                     items = filteredItems,
                     displayMode = gridDisplayMode,
+                    refererUrl = source?.baseUrl,
                     onItemClick = { onOpenManga(it.id) }
                 )
             }
@@ -794,6 +878,7 @@ fun SourceCatalogScreen(
 fun AdaptiveMangaGridOrList(
     items: List<MangaSummary>,
     displayMode: GridDisplayMode,
+    refererUrl: String? = null,
     onItemClick: (MangaSummary) -> Unit
 ) {
     if (displayMode == GridDisplayMode.LIST) {
@@ -803,108 +888,138 @@ fun AdaptiveMangaGridOrList(
             modifier = Modifier.fillMaxSize()
         ) {
             items(items, key = { it.id }) { manga ->
-                MangaListCardItem(manga = manga, onClick = { onItemClick(manga) })
+                MangaListCardItem(
+                    manga = manga,
+                    refererUrl = refererUrl,
+                    onClick = { onItemClick(manga) }
+                )
             }
         }
     } else {
         LazyVerticalGrid(
             columns = GridCells.Adaptive(minSize = displayMode.minCellWidthDp.dp),
-            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
             modifier = Modifier
                 .fillMaxSize()
                 .testTag("manga_grid")
         ) {
             items(items, key = { it.id }) { manga ->
-                MangaGridCardItem(manga = manga, onClick = { onItemClick(manga) })
+                MangaGridCardItem(
+                    manga = manga,
+                    refererUrl = refererUrl,
+                    onClick = { onItemClick(manga) }
+                )
             }
         }
     }
 }
 
+/**
+ * Uniform Manga Grid Card:
+ * - Fixed 2:3 aspect ratio cover container
+ * - Fixed 2-line title container (minLines = 2, maxLines = 2) so all cards in a row have identical height
+ * - Stylized fallback poster when coverUrl fails or is missing
+ */
 @Composable
 fun MangaGridCardItem(
     manga: MangaSummary,
+    refererUrl: String? = null,
     onClick: () -> Unit
 ) {
-    Column(
+    Card(
+        onClick = onClick,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(12.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
             .testTag("manga_card_${manga.id}")
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(0.71f)
-                .clip(RoundedCornerShape(10.dp))
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            SubcomposeAsyncImage(
-                model = manga.coverUrl,
-                contentDescription = manga.title,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-                loading = {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
-                    }
-                },
-                error = {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.verticalGradient(
-                                    listOf(Color(0xFF1E2638), Color(0xFF121622))
-                                )
-                            ),
-                        contentAlignment = Alignment.Center
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(2f / 3f)
+                    .clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                MangaCoverImage(
+                    imageUrl = manga.coverUrl,
+                    title = manga.title,
+                    refererUrl = refererUrl,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                if (!manga.latestChapter.isNullOrBlank()) {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.78f),
+                        shape = RoundedCornerShape(bottomEnd = 8.dp),
+                        modifier = Modifier.align(Alignment.TopStart)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.BrokenImage,
-                            contentDescription = null,
-                            tint = Color(0xFF5A6275),
-                            modifier = Modifier.size(34.dp)
+                        Text(
+                            text = manga.latestChapter,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White,
+                            maxLines = 1,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
                         )
                     }
                 }
-            )
 
-            if (!manga.latestChapter.isNullOrBlank()) {
-                Surface(
-                    color = Color.Black.copy(alpha = 0.72f),
-                    shape = RoundedCornerShape(bottomEnd = 8.dp),
-                    modifier = Modifier.align(Alignment.TopStart)
-                ) {
-                    Text(
-                        text = manga.latestChapter,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Color.White,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                    )
+                if (manga.rating != null) {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.75f),
+                        shape = RoundedCornerShape(topStart = 8.dp),
+                        modifier = Modifier.align(Alignment.BottomEnd)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Star,
+                                contentDescription = null,
+                                tint = StarYellow,
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text(
+                                text = "${manga.rating}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.White
+                            )
+                        }
+                    }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.height(5.dp))
-        Text(
-            text = manga.title,
-            style = MaterialTheme.typography.titleSmall,
-            color = MaterialTheme.colorScheme.onBackground,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        if (manga.genres.isNotEmpty()) {
-            Text(
-                text = manga.genres.joinToString(", "),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = manga.title,
+                    style = MaterialTheme.typography.titleSmall.copy(
+                        fontSize = 13.5.sp,
+                        lineHeight = 18.sp
+                    ),
+                    color = MaterialTheme.colorScheme.onBackground,
+                    minLines = 2,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (manga.genres.isNotEmpty()) manga.genres.take(2).joinToString(" • ") else "مانهوا",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -912,9 +1027,9 @@ fun MangaGridCardItem(
 @Composable
 fun MangaListCardItem(
     manga: MangaSummary,
+    refererUrl: String? = null,
     onClick: () -> Unit
 ) {
-    // Matches Video 2 (00:40) List Mode with title, genres, 5 stars, "إقرأ" link, and cover on the right
     Card(
         onClick = onClick,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -931,13 +1046,14 @@ fun MangaListCardItem(
             Box(
                 modifier = Modifier
                     .width(88.dp)
-                    .height(122.dp)
+                    .height(126.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant)
             ) {
-                SubcomposeAsyncImage(
-                    model = manga.coverUrl,
-                    contentDescription = manga.title,
+                MangaCoverImage(
+                    imageUrl = manga.coverUrl,
+                    title = manga.title,
+                    refererUrl = refererUrl,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
                 )
@@ -952,12 +1068,12 @@ fun MangaListCardItem(
                 Text(
                     text = manga.title,
                     style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = manga.genres.joinToString(","),
+                    text = manga.genres.joinToString(" • "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
@@ -982,7 +1098,7 @@ fun MangaListCardItem(
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "إقرأ",
+                    text = "إقرأ الآن",
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -1043,7 +1159,6 @@ fun RecommendationsScreen(
         }
 
         if (!browseAllMode || allManga.isEmpty()) {
-            // Exact Kaomoji from Video 2 (03:55): ( ⊙д⊙ ) + "لا تتوفر تصنيفات كافية لتوصياتك. يمكنك تصفح «الكل»." + "إعادة المحاولة"
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1114,7 +1229,6 @@ fun FavoritesScreen(
             Text(text = "المفضلة", style = MaterialTheme.typography.headlineMedium)
         }
 
-        // Category Tabs matching Video 2 (04:00): "الكل 0 | قراءة الآن 0 | قراءة لاحقاً 0"
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1167,7 +1281,7 @@ fun HistoryAndUpdatesScreen(
     historyItems: List<Pair<ReadingHistoryEntity, MangaSummary>>,
     onOpenDrawer: () -> Unit,
     onOpenManga: (String) -> Unit,
-    onResumeChapter: (String, String, Int) -> Unit,
+    onResumeChapter: (String, String, Int, Int) -> Unit,
     onClearHistory: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
@@ -1233,12 +1347,12 @@ fun HistoryAndUpdatesScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.weight(1f)
                             ) {
-                                SubcomposeAsyncImage(
-                                    model = manga.coverUrl,
-                                    contentDescription = manga.title,
+                                MangaCoverImage(
+                                    imageUrl = manga.coverUrl,
+                                    title = manga.title,
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier
-                                        .size(56.dp, 76.dp)
+                                        .size(56.dp, 78.dp)
                                         .clip(RoundedCornerShape(8.dp))
                                 )
                                 Spacer(modifier = Modifier.width(12.dp))
@@ -1246,9 +1360,10 @@ fun HistoryAndUpdatesScreen(
                                     Text(
                                         text = manga.title,
                                         style = MaterialTheme.typography.titleMedium,
-                                        maxLines = 1,
+                                        maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                    Spacer(modifier = Modifier.height(2.dp))
                                     Text(
                                         text = "الفصل ${hist.chapterTitle} • الصفحة ${hist.pageIndex}",
                                         style = MaterialTheme.typography.bodySmall,
@@ -1256,12 +1371,14 @@ fun HistoryAndUpdatesScreen(
                                     )
                                 }
                             }
+                            Spacer(modifier = Modifier.width(8.dp))
                             Button(
                                 onClick = {
                                     onResumeChapter(
                                         manga.id,
                                         hist.chapterId,
-                                        (hist.pageIndex - 1).coerceAtLeast(0)
+                                        (hist.pageIndex - 1).coerceAtLeast(0),
+                                        hist.scrollOffset
                                     )
                                 },
                                 shape = RoundedCornerShape(18.dp)

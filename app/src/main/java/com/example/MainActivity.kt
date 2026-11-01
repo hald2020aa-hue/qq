@@ -57,7 +57,6 @@ import com.example.features.sourcemanager.AddSiteAndVerificationDialogs
 import com.example.features.sourcemanager.InternalBrowserScreen
 import com.example.features.sourcemanager.SourceManagerScreen
 import com.example.ui.theme.MangaReaderTheme
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -223,8 +222,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             historyItems = readingHistory,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
                             onOpenManga = { vm.navigateTo(ScreenRoute.MangaDetailsRoute(it)) },
-                            onResumeChapter = { mId, chId, page ->
-                                vm.navigateTo(ScreenRoute.ReaderRoute(mId, chId, page))
+                            onResumeChapter = { mId, chId, page, offset ->
+                                vm.navigateTo(ScreenRoute.ReaderRoute(mId, chId, page, offset))
                             },
                             onClearHistory = {}
                         )
@@ -249,8 +248,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             historyItems = readingHistory,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
                             onOpenManga = { vm.navigateTo(ScreenRoute.MangaDetailsRoute(it)) },
-                            onResumeChapter = { mId, chId, page ->
-                                vm.navigateTo(ScreenRoute.ReaderRoute(mId, chId, page))
+                            onResumeChapter = { mId, chId, page, offset ->
+                                vm.navigateTo(ScreenRoute.ReaderRoute(mId, chId, page, offset))
                             },
                             onClearHistory = vm::clearReadingHistory
                         )
@@ -299,8 +298,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             },
                             onToggleSort = vm::toggleChapterSortOrder,
                             onToggleFavorite = { vm.toggleFavorite(route.mangaId, isFav) },
-                            onOpenChapterReader = { chId, page ->
-                                vm.navigateTo(ScreenRoute.ReaderRoute(route.mangaId, chId, page))
+                            onOpenChapterReader = { chId, page, offset ->
+                                vm.navigateTo(ScreenRoute.ReaderRoute(route.mangaId, chId, page, offset))
                             },
                             onDownloadSingleChapter = { chId ->
                                 vm.downloadSingleChapter(route.mangaId, chId)
@@ -337,7 +336,7 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             onToggleFavorite = { vm.toggleFavorite(route.mangaId, isFav) },
                             onToggleBookmark = vm::toggleReaderBookmark,
                             onSelectChapter = { nextChapterId ->
-                                vm.loadReaderChapter(route.mangaId, nextChapterId, 0)
+                                vm.loadReaderChapter(route.mangaId, nextChapterId, 0, 0)
                             },
                             onChangeReaderMode = vm::setReaderMode,
                             onOpenReadingSettings = { vm.navigateTo(ScreenRoute.SettingsSub("reading")) },
@@ -395,7 +394,7 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                     }
                 }
 
-                // Floating "متابعة" (Continue Reading) Button on Main/Catalog Screens matching Video 1 & 2
+                // Floating "متابعة" (Continue Reading) Button on Main/Catalog Screens
                 val showContinueFab = settings.showContinueReadingButton && (
                     currentRoute is ScreenRoute.Storage ||
                         currentRoute is ScreenRoute.SourceCatalog ||
@@ -413,7 +412,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                                 ScreenRoute.ReaderRoute(
                                     mangaId = latest.first.mangaId,
                                     chapterId = latest.first.chapterId,
-                                    initialPage = (latest.first.pageIndex - 1).coerceAtLeast(0)
+                                    initialPage = (latest.first.pageIndex - 1).coerceAtLeast(0),
+                                    initialScrollOffset = latest.first.scrollOffset
                                 )
                             )
                         } else {
@@ -425,7 +425,6 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                         .padding(20.dp)
                 )
 
-                // Toast / Snackbar Pill at Bottom matching Video 1 (00:44 "تم الإضافة بنجاح" & Video 2 01:22 "بدأ التنزيل")
                 if (!toastMessage.isNullOrBlank()) {
                     Surface(
                         shape = RoundedCornerShape(22.dp),
@@ -448,7 +447,6 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
         }
     }
 
-    // Global Add Site / Compatibility / Cloudflare Verification Dialogs
     AddSiteAndVerificationDialogs(
         state = addSiteDialogState,
         onInputChanged = vm::updateAddSiteInput,
@@ -459,7 +457,6 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
         onCompleteCloudflareVerify = vm::completeCloudflareHumanVerification
     )
 
-    // Login Prompt Modal matching Video 2 (00:04): "سجّل دخولك لتحفظ حسابك"
     if (showLoginPrompt) {
         Dialog(onDismissRequest = vm::dismissLoginPrompt) {
             Surface(

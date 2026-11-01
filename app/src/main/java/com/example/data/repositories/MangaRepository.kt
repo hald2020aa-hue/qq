@@ -108,6 +108,12 @@ class MangaRepository(
         list.map { it.toSummary() }
     }
 
+    /**
+     * Fast catalog sync: fetches popular/latest summaries for [sourceId] and upserts them
+     * into Room WITHOUT firing sequential per-item getDetails() requests (which previously
+     * caused 60-90s loading spinners). Full details and chapters are fetched on-demand when
+     * opening a manga's details screen.
+     */
     suspend fun refreshSourceCatalog(sourceId: String, page: Int = 1): Result<List<MangaSummary>> {
         val connector = registry.findById(sourceId)
             ?: return Result.failure(IllegalStateException("المصدر غير موجود"))
@@ -118,28 +124,34 @@ class MangaRepository(
 
         return try {
             val result = connector.getPopular(page)
-            val existingList = dao.observeAllManga()
-            val entities = result.items.map { summary ->
-                val existing = dao.getMangaById(summary.id)
-                val details = runCatching { connector.getDetails(summary.mangaUrl) }.getOrNull()
-                MangaEntity(
-                    id = summary.id,
-                    sourceId = summary.sourceId,
-                    remoteId = summary.mangaUrl,
-                    title = summary.title,
-                    coverUrl = summary.coverUrl,
-                    description = details?.description ?: existing?.description.orEmpty(),
-                    status = details?.status ?: summary.status ?: "OnGoing",
-                    author = details?.author ?: existing?.author,
-                    artist = details?.artist ?: existing?.artist,
-                    genresCsv = (details?.genres ?: summary.genres).joinToString(","),
-                    rating = details?.rating ?: summary.rating ?: 4.5f,
-                    latestChapter = summary.latestChapter,
-                    isSavedInStorage = existing?.isSavedInStorage ?: false,
-                    updatedAt = System.currentTimeMillis()
-                )
+            val entities = result.items
+                .filter { it.title.isNotBlank() && it.mangaUrl.isNotBlank() }
+                .map { summary ->
+                    val existing = dao.getMangaById(summary.id)
+                    MangaEntity(
+                        id = summary.id,
+                        sourceId = summary.sourceId,
+                        remoteId = summary.mangaUrl,
+                        title = summary.title.trim(),
+                        coverUrl = summary.coverUrl?.takeIf { it.isNotBlank() } ?: existing?.coverUrl,
+                        description = existing?.description.orEmpty(),
+                        status = summary.status ?: existing?.status ?: "OnGoing",
+                        author = existing?.author,
+                        artist = existing?.artist,
+                        genresCsv = if (summary.genres.isNotEmpty()) {
+                            summary.genres.joinToString(",")
+                        } else {
+                            existing?.genresCsv.orEmpty()
+                        },
+                        rating = summary.rating ?: existing?.rating ?: 4.6f,
+                        latestChapter = summary.latestChapter ?: existing?.latestChapter,
+                        isSavedInStorage = existing?.isSavedInStorage ?: false,
+                        updatedAt = System.currentTimeMillis()
+                    )
+                }
+            if (entities.isNotEmpty()) {
+                dao.upsertMangaList(entities)
             }
-            dao.upsertMangaList(entities)
             Result.success(result.items)
         } catch (e: Exception) {
             Result.failure(e)
@@ -150,27 +162,70 @@ class MangaRepository(
         val mangaEntity = dao.getMangaById(mangaId)
             ?: return Result.failure(IllegalStateException("لم يتم العثور على المانهوا"))
         val connector = registry.findById(mangaEntity.sourceId)
-            ?: return Result.failure(IllegalStateException("موصل المصدر غير متوفر"))
 
-        val remoteDetails = connector.getDetails(mangaEntity.remoteId)
-        val chapterEntities = remoteDetails.chapters.map { ch ->
-            ChapterEntity(
-                id = ch.id,
-                mangaId = mangaId,
-                sourceId = mangaEntity.sourceId,
-                remoteId = ch.remoteId,
-                title = ch.title,
-                chapterNumber = ch.chapterNumber,
-                uploadDate = ch.uploadDate,
-                dateLabel = ch.dateLabel,
-                isRead = ch.isRead,
-                isDownloaded = ch.isDownloaded
+        return try {
+            if (connector == null) {
+                val cachedChapters = dao.getChaptersByMangaOnce(mangaId).map { it.toDomain() }
+                return Result.success(mangaEntity.toDetails(cachedChapters))
+            }
+
+            val remoteDetails = connector.getDetails(mangaEntity.remoteId)
+
+            // Update cached MangaEntity with newly fetched metadata & cover
+            val updatedEntity = mangaEntity.copy(
+                title = remoteDetails.title.ifBlank { mangaEntity.title },
+                coverUrl = remoteDetails.coverUrl?.takeIf { it.isNotBlank() } ?: mangaEntity.coverUrl,
+                description = remoteDetails.description.ifBlank { mangaEntity.description },
+                status = remoteDetails.status?.takeIf { it.isNotBlank() } ?: mangaEntity.status,
+                author = remoteDetails.author ?: mangaEntity.author,
+                artist = remoteDetails.artist ?: mangaEntity.artist,
+                genresCsv = if (remoteDetails.genres.isNotEmpty()) {
+                    remoteDetails.genres.joinToString(",")
+                } else {
+                    mangaEntity.genresCsv
+                },
+                rating = remoteDetails.rating ?: mangaEntity.rating,
+                latestChapter = remoteDetails.chapters.maxByOrNull { it.chapterNumber ?: 0f }?.let { "فصل ${it.title}" }
+                    ?: mangaEntity.latestChapter,
+                updatedAt = System.currentTimeMillis()
             )
-        }
-        dao.syncChaptersPreservingState(mangaId, chapterEntities)
+            dao.upsertManga(updatedEntity)
 
-        val updatedChapters = dao.getChaptersByMangaOnce(mangaId).map { it.toDomain() }
-        return Result.success(remoteDetails.copy(chapters = updatedChapters))
+            val chapterEntities = remoteDetails.chapters.map { ch ->
+                ChapterEntity(
+                    id = ch.id,
+                    mangaId = mangaId,
+                    sourceId = mangaEntity.sourceId,
+                    remoteId = ch.remoteId,
+                    title = ch.title,
+                    chapterNumber = ch.chapterNumber,
+                    uploadDate = ch.uploadDate,
+                    dateLabel = ch.dateLabel,
+                    isRead = ch.isRead,
+                    isDownloaded = ch.isDownloaded
+                )
+            }
+            if (chapterEntities.isNotEmpty()) {
+                dao.syncChaptersPreservingState(mangaId, chapterEntities)
+            }
+
+            val updatedChapters = dao.getChaptersByMangaOnce(mangaId).map { it.toDomain() }
+            Result.success(
+                remoteDetails.copy(
+                    coverUrl = updatedEntity.coverUrl,
+                    description = updatedEntity.description,
+                    chapters = updatedChapters
+                )
+            )
+        } catch (e: Exception) {
+            // Offline fallback: return cached Room details & chapters if available
+            val cachedChapters = dao.getChaptersByMangaOnce(mangaId).map { it.toDomain() }
+            if (cachedChapters.isNotEmpty() || mangaEntity.description.isNotBlank()) {
+                Result.success(mangaEntity.toDetails(cachedChapters))
+            } else {
+                Result.failure(e)
+            }
+        }
     }
 
     fun observeChaptersForManga(mangaId: String): Flow<List<MangaChapter>> {
@@ -255,7 +310,6 @@ class MangaRepository(
         scrollOffset: Int,
         totalPages: Int
     ) {
-        val isCompleted = pageIndex >= (totalPages - 1).coerceAtLeast(0)
         dao.updateChapterReadProgress(
             chapterId = chapterId,
             isRead = true,
@@ -401,6 +455,21 @@ class MangaRepository(
         genres = genresCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() },
         rating = rating,
         status = status
+    )
+
+    private fun MangaEntity.toDetails(chapters: List<MangaChapter>) = MangaDetails(
+        id = id,
+        sourceId = sourceId,
+        title = title,
+        alternativeTitles = emptyList(),
+        coverUrl = coverUrl,
+        description = description.ifBlank { "قصة مانهوا مشوّقة متوفرة للقراءة والتنزيل المحلي." },
+        author = author,
+        artist = artist,
+        status = status,
+        genres = genresCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() },
+        rating = rating,
+        chapters = chapters
     )
 
     private fun ChapterEntity.toDomain() = MangaChapter(
