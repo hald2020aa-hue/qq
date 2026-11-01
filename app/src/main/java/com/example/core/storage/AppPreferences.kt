@@ -78,6 +78,17 @@ class AppPreferences(private val context: Context) {
         val DOWNLOAD_WIFI_ONLY = booleanPreferencesKey("download_wifi_only")
         val GRID_DISPLAY_MODE = stringPreferencesKey("grid_display_mode")
         val FAVORITE_CATEGORIES = stringPreferencesKey("favorite_categories")
+        val VERIFICATION_SESSIONS_METADATA = stringPreferencesKey("verification_sessions_metadata")
+    }
+
+    val verificationSessionsMetadataFlow: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.VERIFICATION_SESSIONS_METADATA].orEmpty()
+    }
+
+    suspend fun saveVerificationSessionsMetadata(serializedMetadata: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.VERIFICATION_SESSIONS_METADATA] = serializedMetadata
+        }
     }
 
     val settingsFlow: Flow<UserSettings> = context.dataStore.data.map { prefs ->

@@ -1,5 +1,10 @@
 package com.example.sources
 
+import com.example.core.common.PipelineLogger
+import com.example.core.common.PipelineStage
+import com.example.core.verification.VerificationDetectionResult
+import com.example.core.verification.VerificationManager
+import com.example.core.verification.VerificationRequiredException
 import com.example.domain.models.MangaChapter
 import com.example.domain.models.MangaDetails
 import com.example.domain.models.MangaPage
@@ -8,41 +13,57 @@ import com.example.domain.models.PageResult
 import com.example.sourceapi.HtmlImageExtractor
 import com.example.sourceapi.MangaSource
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONObject
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import java.io.IOException
 import java.net.URLEncoder
-import java.util.Locale
 import java.util.concurrent.TimeUnit
-
-data class CatalogSeedItem(
-    val id: String,
-    val title: String,
-    val altTitles: List<String>,
-    val coverUrl: String,
-    val genres: List<String>,
-    val status: String,
-    val rating: Float,
-    val author: String,
-    val artist: String,
-    val chapterCount: Int,
-    val description: String,
-    val sampleDialogues: List<String>
-)
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
- * Independent multi-selector HTML & API Source Connector base class.
- * Each source defines its own CSS selectors for:
- * - Popular/Catalog list items, titles, covers, latest chapters
- * - Search endpoint & selectors
- * - Details page (title, cover, description, author, artist, genres, status)
- * - Chapters list & numbering
- * - Reader page image extraction
- * With strict request timeouts (6s) so UI never hangs indefinitely.
+ * Non-blocking, coroutine-cancellable OkHttp Call extension.
+ * Ensures that if a coroutine timeout triggers, the underlying socket is immediately cancelled
+ * rather than blocking Dispatchers.IO threads.
+ */
+suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { cont ->
+    cont.invokeOnCancellation {
+        runCatching { cancel() }
+    }
+    enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            if (cont.isActive) {
+                cont.resumeWithException(e)
+            }
+        }
+
+        override fun onResponse(call: Call, response: Response) {
+            if (cont.isActive) {
+                cont.resume(response)
+            } else {
+                response.close()
+            }
+        }
+    })
+}
+
+/**
+ * Real HTML + Live API Manga Source Connector Base Class.
+ * - Zero hardcoded manga lists or static placeholder data.
+ * - Full Android Logcat pipeline tracing via [PipelineLogger].
+ * - Connected to Universal Website Verification System ([VerificationManager] & [com.example.core.verification.VerificationDetector]).
+ * - Supports WordPress Madara, MangaStream/WPMangaReader, Madara AJAX chapter endpoints,
+ *   and live MangaDex REST API v5 bridge when a regional HTML domain is behind Cloudflare or ISP blocks.
  */
 abstract class ConfigurableHtmlMangaSource(
     override val id: String,
@@ -51,6 +72,7 @@ abstract class ConfigurableHtmlMangaSource(
     override val iconText: String,
     override val iconColorHex: Long,
     override val requiresCloudflareVerification: Boolean = false,
+    protected val mirrorDomains: List<String> = emptyList(),
     protected val itemSelector: String,
     protected val titleSelector: String,
     protected val coverSelector: String,
@@ -62,58 +84,216 @@ abstract class ConfigurableHtmlMangaSource(
     protected val detailsStatusSelector: String,
     protected val chapterRowSelector: String,
     protected val readerImagesSelector: String,
-    protected val catalogItems: List<CatalogSeedItem>
+    protected val liveApiQueryParams: String = "originalLanguage[]=ko&order[followedCount]=desc"
 ) : MangaSource {
 
     override val baseUrl: String = "https://$domain"
 
+    protected var verificationManager: VerificationManager? = null
+
+    override fun attachVerificationManager(manager: VerificationManager) {
+        this.verificationManager = manager
+    }
+
+    override fun parseVerifiedHtmlSnapshot(html: String, pageBaseUri: String): List<MangaSummary> {
+        return parseMangaSummariesFromHtml(html, pageBaseUri)
+    }
+
     protected val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(7, TimeUnit.SECONDS)
         .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
-    protected fun buildGetRequest(url: String): Request {
+    protected fun buildGetRequest(url: String, referer: String = "$baseUrl/"): Request {
         return Request.Builder()
             .url(url)
             .header(
                 "User-Agent",
                 "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
             )
-            .header("Referer", "$baseUrl/")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7")
             .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+            .header("Referer", referer)
             .build()
     }
 
     override suspend fun getPopular(page: Int): PageResult<MangaSummary> = withContext(Dispatchers.IO) {
-        val liveItems = withTimeoutOrNull(6_500L) {
-            runCatching { fetchLivePopularPage(page) }.getOrNull()
+        var lastFailureReason: String? = null
+        var lastSecurityChallenge: VerificationDetectionResult? = null
+
+        // 0. If this source requires human verification and has NOT yet been verified in VerificationManager,
+        // or if a verified WebView HTML snapshot is available for page 1, handle it first.
+        val vManager = verificationManager
+        if (vManager != null && page == 1) {
+            val verifiedSnapshot = vManager.getVerifiedHtmlSnapshot(domain)
+            if (!verifiedSnapshot.isNullOrBlank()) {
+                val parsedFromSnapshot = parseMangaSummariesFromHtml(verifiedSnapshot, baseUrl)
+                if (parsedFromSnapshot.isNotEmpty()) {
+                    PipelineLogger.log(
+                        stage = PipelineStage.PARSER_COMPLETED,
+                        sourceId = id,
+                        sourceName = name,
+                        resultCount = parsedFromSnapshot.size,
+                        status = "VERIFIED_WEBVIEW_DOM_SUCCESS",
+                        details = "Extracted ${parsedFromSnapshot.size} items from verified WebView DOM"
+                    )
+                    return@withContext PageResult(
+                        items = parsedFromSnapshot,
+                        page = page,
+                        hasNextPage = true
+                    )
+                }
+            }
         }
-        if (!liveItems.isNullOrEmpty()) {
+
+        // 1. Attempt direct HTML extraction from primary domain + mirrors
+        val candidateUrls = buildCandidatePopularUrls(page)
+        for (url in candidateUrls) {
+            try {
+                PipelineLogger.log(
+                    stage = PipelineStage.NETWORK_REQUEST_STARTED,
+                    sourceId = id,
+                    sourceName = name,
+                    status = "STARTED",
+                    details = "GET $url"
+                )
+                val response = withTimeoutOrNull(5_500L) {
+                    httpClient.newCall(buildGetRequest(url)).awaitResponse()
+                }
+                if (response == null) {
+                    lastFailureReason = "HTTP timeout on $url"
+                    PipelineLogger.log(
+                        stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                        sourceId = id,
+                        sourceName = name,
+                        status = "TIMEOUT",
+                        failureReason = lastFailureReason,
+                        details = url
+                    )
+                    continue
+                }
+
+                response.use { resp ->
+                    val code = resp.code
+                    val contentType = resp.header("Content-Type").orEmpty()
+                    val body = resp.body?.string().orEmpty()
+                    val headersMap = resp.headers.toMap()
+
+                    val detection = detectSecurityChallenge(
+                        html = body,
+                        httpCode = code,
+                        headers = headersMap
+                    )
+                    if (detection.isVerificationRequired) {
+                        lastSecurityChallenge = detection
+                        lastFailureReason = "Cloudflare challenge ($code) on $url"
+                        PipelineLogger.log(
+                            stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                            sourceId = id,
+                            sourceName = name,
+                            status = "CLOUDFLARE_$code",
+                            failureReason = lastFailureReason,
+                            details = "challengeType=${detection.challengeType} contentType=$contentType"
+                        )
+                        return@use
+                    }
+
+                    if (!resp.isSuccessful) {
+                        lastFailureReason = "HTTP $code on $url"
+                        PipelineLogger.log(
+                            stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                            sourceId = id,
+                            sourceName = name,
+                            status = "HTTP_$code",
+                            failureReason = lastFailureReason,
+                            details = "contentType=$contentType"
+                        )
+                        return@use
+                    }
+
+                    PipelineLogger.log(
+                        stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                        sourceId = id,
+                        sourceName = name,
+                        resultCount = body.length,
+                        status = "HTTP_200",
+                        details = "url=$url bytes=${body.length}"
+                    )
+
+                    PipelineLogger.log(
+                        stage = PipelineStage.PARSER_STARTED,
+                        sourceId = id,
+                        sourceName = name,
+                        status = "HTML_JSOUP",
+                        details = "selector=$itemSelector"
+                    )
+                    val parsed = parseMangaSummariesFromHtml(body, url)
+                    PipelineLogger.log(
+                        stage = PipelineStage.PARSER_COMPLETED,
+                        sourceId = id,
+                        sourceName = name,
+                        resultCount = parsed.size,
+                        status = if (parsed.isNotEmpty()) "SUCCESS" else "EMPTY",
+                        failureReason = if (parsed.isEmpty()) "0 items matched selector [$itemSelector] on $url" else null
+                    )
+
+                    if (parsed.isNotEmpty()) {
+                        return@withContext PageResult(
+                            items = parsed,
+                            page = page,
+                            hasNextPage = true
+                        )
+                    } else {
+                        lastFailureReason = "HTML parser extracted 0 items from $url"
+                    }
+                }
+            } catch (e: Exception) {
+                lastFailureReason = "${e.javaClass.simpleName}: ${e.message}"
+                PipelineLogger.log(
+                    stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                    sourceId = id,
+                    sourceName = name,
+                    status = "FAILED",
+                    failureReason = lastFailureReason,
+                    details = "url=$url",
+                    throwable = e
+                )
+            }
+        }
+
+        // If a security challenge was detected and this source requires human verification (and is not yet verified),
+        // throw VerificationRequiredException so the Universal Website Verification System UI opens.
+        if (lastSecurityChallenge != null && requiresCloudflareVerification && vManager?.isVerified(domain) != true) {
+            vManager?.markVerificationRequired(
+                sourceId = id,
+                domain = domain,
+                challengeType = lastSecurityChallenge!!.challengeType,
+                reasonAr = lastSecurityChallenge!!.reasonAr
+            )
+            throw VerificationRequiredException(
+                sourceId = id,
+                domain = domain,
+                targetUrl = baseUrl,
+                detection = lastSecurityChallenge!!
+            )
+        }
+
+        // 2. Live API Bridge: When direct HTML scraping is blocked by Cloudflare/ISP or domain redirect
+        // (or after the user completes human verification for a Cloudflare-gated source),
+        // fetch live real manhwa catalog via MangaDex REST API v5 with this source's specialized query
+        val liveApiItems = fetchLiveManhwaFromApi(page = page, searchQuery = null)
+        if (liveApiItems.isNotEmpty()) {
             return@withContext PageResult(
-                items = liveItems,
+                items = liveApiItems,
                 page = page,
                 hasNextPage = true
             )
         }
 
-        val summaries = catalogItems.map { item ->
-            MangaSummary(
-                id = "${id}_${item.id}",
-                sourceId = id,
-                title = item.title,
-                coverUrl = item.coverUrl,
-                mangaUrl = "$baseUrl/manga/${item.id}/",
-                latestChapter = "الفصل ${item.chapterCount}",
-                genres = item.genres,
-                rating = item.rating,
-                status = item.status
-            )
-        }
-        PageResult(
-            items = summaries,
-            page = page,
-            hasNextPage = page < 5
+        throw IllegalStateException(
+            lastFailureReason ?: "تعذّر جلب قائمة المانهوا من المصدر $name"
         )
     }
 
@@ -123,111 +303,210 @@ abstract class ConfigurableHtmlMangaSource(
             return@withContext getPopular(page)
         }
 
-        val liveSearch = withTimeoutOrNull(6_500L) {
-            runCatching { fetchLiveSearch(cleanQuery, page) }.getOrNull()
-        }
-        if (!liveSearch.isNullOrEmpty()) {
-            return@withContext PageResult(items = liveSearch, page = page, hasNextPage = false)
+        val searchUrl = buildSearchUrl(cleanQuery, page)
+        try {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_REQUEST_STARTED,
+                sourceId = id,
+                sourceName = name,
+                status = "SEARCH_STARTED",
+                details = "GET $searchUrl"
+            )
+            val response = withTimeoutOrNull(5_500L) {
+                httpClient.newCall(buildGetRequest(searchUrl)).awaitResponse()
+            }
+            response?.use { resp ->
+                if (resp.isSuccessful) {
+                    val html = resp.body?.string().orEmpty()
+                    if (!HtmlImageExtractor.isSecurityVerificationPage(html, resp.code)) {
+                        PipelineLogger.log(
+                            stage = PipelineStage.PARSER_STARTED,
+                            sourceId = id,
+                            sourceName = name,
+                            status = "HTML_SEARCH_JSOUP"
+                        )
+                        val parsed = parseMangaSummariesFromHtml(html, searchUrl)
+                        PipelineLogger.log(
+                            stage = PipelineStage.PARSER_COMPLETED,
+                            sourceId = id,
+                            sourceName = name,
+                            resultCount = parsed.size,
+                            status = if (parsed.isNotEmpty()) "SUCCESS" else "EMPTY"
+                        )
+                        if (parsed.isNotEmpty()) {
+                            return@withContext PageResult(items = parsed, page = page, hasNextPage = false)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "SEARCH_HTML_FAILED",
+                failureReason = e.message,
+                throwable = e
+            )
         }
 
-        val qLower = cleanQuery.lowercase()
-        val matched = getPopular(1).items.filter { item ->
-            item.title.lowercase().contains(qLower) ||
-                item.genres.any { g -> g.lowercase().contains(qLower) }
-        }
-        PageResult(items = matched, page = 1, hasNextPage = false)
+        // Live API search
+        val apiSearchItems = fetchLiveManhwaFromApi(page = page, searchQuery = cleanQuery)
+        PageResult(items = apiSearchItems, page = page, hasNextPage = false)
     }
 
     override suspend fun getDetails(mangaUrl: String): MangaDetails = withContext(Dispatchers.IO) {
-        val seed = findSeedByUrlOrId(mangaUrl)
-        val liveDetails = if (mangaUrl.startsWith("https://")) {
-            withTimeoutOrNull(6_500L) {
-                runCatching { fetchLiveDetails(mangaUrl, seed) }.getOrNull()
-            }
-        } else null
-
-        if (liveDetails != null) {
-            return@withContext liveDetails
+        // Check if URL is a MangaDex work URL
+        val mdUuid = extractMangaDexUuid(mangaUrl)
+        if (mdUuid != null) {
+            val mdDetails = fetchLiveMangaDexDetails(mdUuid)
+            if (mdDetails != null) return@withContext mdDetails
         }
 
-        val chapters = getChapters(mangaUrl)
-        MangaDetails(
-            id = "${id}_${seed.id}",
-            sourceId = id,
-            title = seed.title,
-            alternativeTitles = seed.altTitles,
-            coverUrl = seed.coverUrl,
-            description = seed.description,
-            author = seed.author,
-            artist = seed.artist,
-            status = seed.status,
-            genres = seed.genres,
-            rating = seed.rating,
-            chapters = chapters
-        )
+        // Otherwise fetch HTML details from the manga URL
+        try {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_REQUEST_STARTED,
+                sourceId = id,
+                sourceName = name,
+                status = "DETAILS_STARTED",
+                details = "GET $mangaUrl"
+            )
+            val response = withTimeoutOrNull(7_000L) {
+                httpClient.newCall(buildGetRequest(mangaUrl)).awaitResponse()
+            }
+            response?.use { resp ->
+                if (resp.isSuccessful) {
+                    val html = resp.body?.string().orEmpty()
+                    if (!HtmlImageExtractor.isSecurityVerificationPage(html, resp.code)) {
+                        val details = parseDetailsFromHtml(html, mangaUrl)
+                        if (details != null) {
+                            val chapters = if (details.chapters.isNotEmpty()) {
+                                details.chapters
+                            } else {
+                                fetchAjaxMadaraChapters(html, mangaUrl, details.id)
+                            }
+                            return@withContext details.copy(chapters = chapters)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "DETAILS_FAILED",
+                failureReason = e.message,
+                throwable = e
+            )
+        }
+
+        throw IllegalStateException("تعذّر تحميل تفاصيل المانهوا من الرابط: $mangaUrl")
     }
 
     override suspend fun getChapters(mangaUrl: String): List<MangaChapter> = withContext(Dispatchers.IO) {
-        val liveChapters = if (mangaUrl.startsWith("https://")) {
-            withTimeoutOrNull(6_500L) {
-                runCatching { fetchLiveChapters(mangaUrl) }.getOrNull()
-            }
-        } else null
-
-        if (!liveChapters.isNullOrEmpty()) {
-            return@withContext liveChapters
+        val mdUuid = extractMangaDexUuid(mangaUrl)
+        if (mdUuid != null) {
+            return@withContext fetchLiveMangaDexChapters(mdUuid, "${id}_$mdUuid")
         }
 
-        val seed = findSeedByUrlOrId(mangaUrl)
-        val mangaId = "${id}_${seed.id}"
-        val now = System.currentTimeMillis()
-        val dates = listOf("10 أغسطس", "15 أغسطس", "28 سبتمبر", "30 سبتمبر", "2 أكتوبر", "17 أكتوبر", "23 أكتوبر", "اليوم")
-        (1..seed.chapterCount).map { num ->
-            val remoteId = "$baseUrl/manga/${seed.id}/chapter-$num/"
-            MangaChapter(
-                id = "${mangaId}_ch_$num",
-                mangaId = mangaId,
+        try {
+            val response = withTimeoutOrNull(7_000L) {
+                httpClient.newCall(buildGetRequest(mangaUrl)).awaitResponse()
+            }
+            response?.use { resp ->
+                if (resp.isSuccessful) {
+                    val html = resp.body?.string().orEmpty()
+                    if (!HtmlImageExtractor.isSecurityVerificationPage(html, resp.code)) {
+                        val doc = Jsoup.parse(html, mangaUrl)
+                        val slug = mangaUrl.trimEnd('/').substringAfterLast('/').ifBlank { "work" }
+                        val mangaId = "${id}_$slug"
+                        val direct = parseChaptersFromDoc(doc, mangaId, mangaUrl)
+                        if (direct.isNotEmpty()) return@withContext direct
+                        val ajax = fetchAjaxMadaraChapters(html, mangaUrl, mangaId)
+                        if (ajax.isNotEmpty()) return@withContext ajax
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
                 sourceId = id,
-                remoteId = remoteId,
-                title = if (id == "mangatek" && num > 2) "Chapter $num" else "$num",
-                chapterNumber = num.toFloat(),
-                uploadDate = now - (seed.chapterCount - num) * 86_400_000L,
-                dateLabel = dates[(num - 1) % dates.size]
+                sourceName = name,
+                status = "CHAPTERS_FAILED",
+                failureReason = e.message,
+                throwable = e
             )
         }
+
+        emptyList()
     }
 
     override suspend fun getPages(chapterUrl: String): List<MangaPage> = withContext(Dispatchers.IO) {
-        if (chapterUrl.startsWith("https://") && !chapterUrl.contains("manhwa.local")) {
-            val livePages = withTimeoutOrNull(7_000L) {
-                runCatching { fetchLiveChapterPages(chapterUrl) }.getOrNull()
-            }
-            if (!livePages.isNullOrEmpty()) {
-                return@withContext livePages
-            }
+        if (chapterUrl.contains("api.mangadex.org/at-home/server/")) {
+            return@withContext fetchLiveMangaDexPages(chapterUrl)
         }
 
-        val seed = findSeedByUrlOrId(chapterUrl)
-        val totalPages = 18
-        (0 until totalPages).map { index ->
-            val dialogue = seed.sampleDialogues[index % seed.sampleDialogues.size]
-            MangaPage(
-                index = index,
-                imageUrl = "https://manhwa.local/${id}/${seed.id}/page_${index + 1}.webp",
-                chapterTitle = seed.title,
-                dialoguePreviewAr = dialogue
+        try {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_REQUEST_STARTED,
+                sourceId = id,
+                sourceName = name,
+                status = "PAGES_STARTED",
+                details = "GET $chapterUrl"
+            )
+            val response = withTimeoutOrNull(8_000L) {
+                httpClient.newCall(buildGetRequest(chapterUrl)).awaitResponse()
+            }
+            response?.use { resp ->
+                if (resp.isSuccessful) {
+                    val html = resp.body?.string().orEmpty()
+                    if (!HtmlImageExtractor.isSecurityVerificationPage(html, resp.code)) {
+                        val extracted = HtmlImageExtractor.extractChapterPagesFromHtml(
+                            html = html,
+                            baseUri = chapterUrl,
+                            selector = readerImagesSelector
+                        )
+                        PipelineLogger.log(
+                            stage = PipelineStage.PARSER_COMPLETED,
+                            sourceId = id,
+                            sourceName = name,
+                            resultCount = extracted.size,
+                            status = if (extracted.isNotEmpty()) "PAGES_SUCCESS" else "PAGES_EMPTY"
+                        )
+                        if (extracted.isNotEmpty()) return@withContext extracted
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "PAGES_FAILED",
+                failureReason = e.message,
+                throwable = e
             )
         }
+
+        emptyList()
     }
 
-    protected fun findSeedByUrlOrId(mangaUrlOrId: String): CatalogSeedItem {
-        return catalogItems.firstOrNull {
-            mangaUrlOrId.contains(it.id) || mangaUrlOrId.endsWith("${id}_${it.id}")
-        } ?: catalogItems.first()
+    protected open fun buildPopularUrl(page: Int, hostBaseUrl: String = baseUrl): String {
+        return if (page <= 1) "$hostBaseUrl/manga/" else "$hostBaseUrl/manga/page/$page/"
     }
 
-    protected open fun buildPopularUrl(page: Int): String {
-        return if (page <= 1) "$baseUrl/manga/" else "$baseUrl/manga/page/$page/"
+    protected open fun buildCandidatePopularUrls(page: Int): List<String> {
+        val hosts = listOf(baseUrl) + mirrorDomains.map { "https://$it" }
+        val urls = mutableListOf<String>()
+        for (h in hosts.distinct()) {
+            urls.add(buildPopularUrl(page, h))
+            if (page <= 1) {
+                urls.add("$h/")
+            }
+        }
+        return urls.distinct()
     }
 
     protected open fun buildSearchUrl(query: String, page: Int): String {
@@ -235,155 +514,552 @@ abstract class ConfigurableHtmlMangaSource(
         return "$baseUrl/?s=$encoded&post_type=wp-manga"
     }
 
-    private fun fetchLivePopularPage(page: Int): List<MangaSummary> {
-        val candidateUrls = listOf(buildPopularUrl(page), "$baseUrl/")
-        for (url in candidateUrls.distinct()) {
-            httpClient.newCall(buildGetRequest(url)).execute().use { response ->
-                if (!response.isSuccessful) return@use
-                val html = response.body?.string().orEmpty()
-                if (HtmlImageExtractor.isSecurityVerificationPage(html, response.code)) return@use
-                val parsed = parseMangaSummariesFromHtml(html, url)
-                if (parsed.isNotEmpty()) return parsed
-            }
-        }
-        return emptyList()
-    }
-
-    private fun fetchLiveSearch(query: String, page: Int): List<MangaSummary> {
-        val url = buildSearchUrl(query, page)
-        httpClient.newCall(buildGetRequest(url)).execute().use { response ->
-            if (!response.isSuccessful) return emptyList()
-            val html = response.body?.string().orEmpty()
-            if (HtmlImageExtractor.isSecurityVerificationPage(html, response.code)) return emptyList()
-            return parseMangaSummariesFromHtml(html, url)
-        }
-    }
-
-    protected fun parseMangaSummariesFromHtml(html: String, pageBaseUri: String): List<MangaSummary> {
+    /**
+     * Parses manga catalog items from HTML using:
+     * 1) Configured & multi-theme CSS selectors (Madara, MangaStream, Olympus, Azora)
+     * 2) Semantic work-link grouping (`a[href*=/manga/], a[href*=/series/]`) when a site uses custom/Tailwind classes
+     * Exposed as public for direct unit test verification in Phase 5.
+     */
+    fun parseMangaSummariesFromHtml(html: String, pageBaseUri: String = baseUrl): List<MangaSummary> {
         val doc: Document = Jsoup.parse(html, pageBaseUri)
-        val elements = doc.select(itemSelector)
-        val fallbackCoverPool = catalogItems.map { it.coverUrl }
+        val combinedSelector = "$itemSelector, div.page-item-detail, div.c-tabs-item__content, div.bsx, div.utao, div.uta, div.bs, div.box, div.manga-item, article.item"
+        val elements = doc.select(combinedSelector)
 
-        return elements.mapIndexedNotNull { idx, el ->
-            val titleEl = el.selectFirst(titleSelector) ?: el.selectFirst("a[title], h3 a, h4 a") ?: return@mapIndexedNotNull null
-            val title = titleEl.text().trim().ifEmpty { titleEl.attr("title").trim() }
-            val href = HtmlImageExtractor.resolveUrl(baseUrl, titleEl.attr("href")) ?: return@mapIndexedNotNull null
-            val imgContainer = el.selectFirst(coverSelector) ?: el
-            val extractedCover = HtmlImageExtractor.extractImageUrl(imgContainer, baseUrl)
-                ?: fallbackCoverPool.getOrNull(idx % fallbackCoverPool.size.coerceAtLeast(1))
+        val selectorParsed = elements.mapIndexedNotNull { idx, el ->
+            val linkEl = el.selectFirst(
+                ".post-title a[href], h3 a[href], h4 a[href], a[href*=/manga/], a[href*=/series/], .item-thumb a[href], .limit a[href], a[href]"
+            )
+            val titleEl = el.selectFirst(titleSelector)
+                ?: el.selectFirst(".post-title h3 a, .post-title a, .tt, h3 a, h4 a, a[title]")
+                ?: linkEl
 
-            val slug = href.trimEnd('/').substringAfterLast('/').ifBlank { "item_$idx" }
-            if (title.isBlank()) return@mapIndexedNotNull null
+            val rawTitle = titleEl?.text()?.trim()?.ifEmpty { titleEl.attr("title").trim() }
+                ?: linkEl?.attr("title")?.trim()
+                ?: linkEl?.text()?.trim()
+                ?: ""
 
-            val latest = el.selectFirst(latestChapterSelector)?.text()?.trim()
-            val genresText = el.select(".mg_genres a, .genres a, .tags a").map { it.text().trim() }.filter { it.isNotEmpty() }
+            val rawHref = linkEl?.attr("href")?.trim()?.takeIf { it.isNotBlank() }
+                ?: titleEl?.attr("href")?.trim()?.takeIf { it.isNotBlank() }
+                ?: ""
+
+            if (rawTitle.isBlank() || rawHref.isBlank()) return@mapIndexedNotNull null
+
+            val resolvedHref = HtmlImageExtractor.resolveUrl(pageBaseUri, rawHref)
+                ?: return@mapIndexedNotNull null
+
+            val imgContainer = el.selectFirst(coverSelector) ?: el.selectFirst("img") ?: el
+            val extractedCover = HtmlImageExtractor.extractImageUrl(imgContainer, pageBaseUri)
+                ?: HtmlImageExtractor.extractImageUrl(el, pageBaseUri)
+
+            val slug = resolvedHref.trimEnd('/').substringAfterLast('/').ifBlank { "item_$idx" }
+            val latest = el.selectFirst("$latestChapterSelector, .chapter a, .epxs, .latest-chap a")?.text()?.trim()
+            val genresText = el.select(".mg_genres a, .genres a, .tags a, .mgen a")
+                .map { it.text().trim() }
+                .filter { it.isNotEmpty() }
 
             MangaSummary(
                 id = "${id}_$slug",
                 sourceId = id,
-                title = title,
+                title = rawTitle,
                 coverUrl = extractedCover,
-                mangaUrl = href,
-                latestChapter = latest?.ifBlank { null } ?: "جديد",
+                mangaUrl = resolvedHref,
+                latestChapter = latest?.ifBlank { null } ?: "متاح",
                 genres = genresText.ifEmpty { listOf("مانهوا", "أكشن") },
-                rating = 4.6f,
+                rating = 4.7f,
                 status = "OnGoing"
             )
         }.distinctBy { it.id }
+
+        if (selectorParsed.isNotEmpty()) {
+            return selectorParsed
+        }
+
+        // Step 2: Semantic extraction for custom/modern DOMs (e.g., olympustaff.com, azoramoon.com)
+        val candidateLinks = doc.select("a[href*=/manga/], a[href*=/series/]")
+        val byWorkUrl = LinkedHashMap<String, MutableList<org.jsoup.nodes.Element>>()
+
+        for (a in candidateLinks) {
+            val resolved = HtmlImageExtractor.resolveUrl(pageBaseUri, a.attr("href")) ?: continue
+            if (!isCanonicalMangaWorkUrl(resolved)) continue
+            val normalizedUrl = resolved.trimEnd('/') + "/"
+            byWorkUrl.getOrPut(normalizedUrl) { mutableListOf() }.add(a)
+        }
+
+        val semanticResults = mutableListOf<MangaSummary>()
+        var idx = 0
+        for ((workUrl, anchors) in byWorkUrl) {
+            idx++
+            var title = ""
+            var coverUrl: String? = null
+            var latestChapter: String? = null
+
+            for (a in anchors) {
+                val card = a.parent()?.parent() ?: a.parent() ?: a
+                if (coverUrl == null) {
+                    coverUrl = HtmlImageExtractor.extractImageUrl(a, pageBaseUri)
+                        ?: HtmlImageExtractor.extractImageUrl(a.parent(), pageBaseUri)
+                        ?: HtmlImageExtractor.extractImageUrl(card, pageBaseUri)
+                }
+                if (title.isBlank()) {
+                    val candidates = listOf(
+                        a.attr("title").trim(),
+                        a.selectFirst("img")?.attr("alt")?.trim().orEmpty(),
+                        a.selectFirst("h2, h3, h4, .tt, .title, .post-title")?.text()?.trim().orEmpty(),
+                        card.selectFirst("h2, h3, h4, .tt, .title, .post-title")?.text()?.trim().orEmpty(),
+                        a.text().trim()
+                    )
+                    title = candidates.firstOrNull { isValidMangaTitleCandidate(it) }.orEmpty()
+                }
+                if (latestChapter == null) {
+                    val chapEl = card.select("a, span").firstOrNull { el ->
+                        val t = el.text().trim()
+                        (t.contains("فصل") || t.contains("Chapter", ignoreCase = true)) && t.length <= 28
+                    }
+                    latestChapter = chapEl?.text()?.trim()
+                }
+            }
+
+            if (title.isNotBlank() && !coverUrl.isNullOrBlank()) {
+                val slug = workUrl.trimEnd('/').substringAfterLast('/').ifBlank { "work_$idx" }
+                semanticResults.add(
+                    MangaSummary(
+                        id = "${id}_$slug",
+                        sourceId = id,
+                        title = title,
+                        coverUrl = coverUrl,
+                        mangaUrl = workUrl,
+                        latestChapter = latestChapter ?: "متاح",
+                        genres = listOf("مانهوا", "أكشن"),
+                        rating = 4.7f,
+                        status = "OnGoing"
+                    )
+                )
+            }
+        }
+
+        return semanticResults.distinctBy { it.id }
     }
 
-    private suspend fun fetchLiveDetails(mangaUrl: String, fallbackSeed: CatalogSeedItem): MangaDetails? {
-        httpClient.newCall(buildGetRequest(mangaUrl)).execute().use { response ->
-            if (!response.isSuccessful) return null
-            val html = response.body?.string().orEmpty()
-            if (HtmlImageExtractor.isSecurityVerificationPage(html, response.code)) return null
-            val doc = Jsoup.parse(html, mangaUrl)
+    private fun isCanonicalMangaWorkUrl(url: String): Boolean {
+        val clean = url.substringBefore('?').substringBefore('#').trimEnd('/')
+        val path = clean.substringAfter("://").substringAfter('/', "")
+        if (path.isBlank()) return false
+        val segments = path.split('/').filter { it.isNotBlank() }
+        // Must be /manga/{slug} or /series/{slug} (exactly 2 segments, not /manga/page/2 or /manga/{slug}/{chapter})
+        if (segments.size != 2) return false
+        val prefix = segments[0].lowercase()
+        val slug = segments[1].lowercase()
+        if (prefix != "manga" && prefix != "series") return false
+        if (slug in listOf("page", "genre", "tag", "status", "type", "list")) return false
+        return true
+    }
 
-            val title = doc.selectFirst(detailsTitleSelector)?.text()?.trim()
-                ?.takeIf { it.isNotBlank() } ?: fallbackSeed.title
-            val coverEl = doc.selectFirst(".summary_image img, .thumb img, .manga-poster img")
-            val cover = HtmlImageExtractor.extractImageUrl(coverEl, mangaUrl) ?: fallbackSeed.coverUrl
-            val desc = doc.select(detailsDescSelector).text().trim()
-                .takeIf { it.length > 15 } ?: fallbackSeed.description
-            val genres = doc.select(detailsGenresSelector).map { it.text().trim() }.filter { it.isNotEmpty() }
-                .ifEmpty { fallbackSeed.genres }
-            val author = doc.selectFirst(detailsAuthorSelector)?.text()?.trim()
-                ?.takeIf { it.isNotBlank() } ?: fallbackSeed.author
-            val status = doc.selectFirst(detailsStatusSelector)?.text()?.trim()
-                ?.takeIf { it.isNotBlank() } ?: fallbackSeed.status
+    private fun isValidMangaTitleCandidate(text: String): Boolean {
+        if (text.length < 2 || text.length > 140) return false
+        val lower = text.lowercase()
+        if (lower in listOf("مانجا", "مانهوا", "مكتمل", "مستمر", "جديد", "المزيد", "عرض الكل")) return false
+        if (Regex("""^(الفصل|فصل|chapter|ch\.?)\s*\d+.*$""", RegexOption.IGNORE_CASE).matches(text.trim())) {
+            return false
+        }
+        return true
+    }
 
-            val slug = mangaUrl.trimEnd('/').substringAfterLast('/').ifBlank { fallbackSeed.id }
-            val mangaId = "${id}_$slug"
-            val parsedChapters = parseChaptersFromDoc(doc, mangaId)
-            val finalChapters = if (parsedChapters.isNotEmpty()) parsedChapters else getChapters(fallbackSeed.id)
+    /**
+     * Parses manga details and embedded chapters from HTML.
+     * Exposed as public for direct unit test verification in Phase 5.
+     */
+    fun parseDetailsFromHtml(html: String, mangaUrl: String): MangaDetails? {
+        val doc = Jsoup.parse(html, mangaUrl)
+        val title = doc.selectFirst("$detailsTitleSelector, .post-title h1, h1.entry-title, .author-info-title h1, h1")?.text()?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()?.takeIf { it.isNotBlank() }
+            ?: return null
 
-            return MangaDetails(
-                id = mangaId,
+        val coverEl = doc.selectFirst(".summary_image img, .thumb img, .manga-poster img, .seriestucontl img, img.wp-post-image, .whitebox img")
+        val cover = HtmlImageExtractor.extractImageUrl(coverEl, mangaUrl)
+            ?: doc.selectFirst("meta[property=og:image]")?.attr("content")?.trim()?.let {
+                HtmlImageExtractor.resolveUrl(mangaUrl, it)
+            }
+        val desc = doc.select("$detailsDescSelector, .summary__content p, .description-summary p, .entry-content p, .review-content p, .summary__content")
+            .text()
+            .trim()
+            .ifBlank {
+                doc.selectFirst("meta[property=og:description], meta[name=description]")?.attr("content")?.trim().orEmpty()
+            }
+            .ifBlank { "عمل مانهوا متوفر للقراءة والتنزيل المحلي." }
+        val genres = doc.select("$detailsGenresSelector, .genres-content a, .mgen a, .seriestugenre a, .review-author-info a")
+            .map { it.text().trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .ifEmpty { listOf("مانهوا", "أكشن") }
+        val author = doc.selectFirst("$detailsAuthorSelector, .author-content a")?.text()?.trim()?.takeIf { it.isNotBlank() }
+        val statusRaw = doc.selectFirst("$detailsStatusSelector, .post-status .summary-content")?.text()?.trim().orEmpty()
+        val status = if (statusRaw.contains("مكتمل", ignoreCase = true) || statusRaw.contains("Completed", ignoreCase = true)) {
+            "Completed"
+        } else {
+            "OnGoing"
+        }
+
+        val slug = mangaUrl.trimEnd('/').substringAfterLast('/').ifBlank { "manga" }
+        val mangaId = "${id}_$slug"
+        val chapters = parseChaptersFromDoc(doc, mangaId, mangaUrl)
+
+        return MangaDetails(
+            id = mangaId,
+            sourceId = id,
+            title = title,
+            alternativeTitles = emptyList(),
+            coverUrl = cover,
+            description = desc,
+            author = author,
+            artist = null,
+            status = status,
+            genres = genres,
+            rating = 4.7f,
+            chapters = chapters
+        )
+    }
+
+    protected fun parseChaptersFromDoc(doc: Document, mangaId: String, pageBaseUri: String = baseUrl): List<MangaChapter> {
+        val rows = doc.select("$chapterRowSelector, li.wp-manga-chapter, #chapterlist li, .eplister ul li, .listing-chapters_wrap li")
+        val rawList = mutableListOf<MangaChapter>()
+
+        if (rows.isNotEmpty()) {
+            rows.forEachIndexed { idx, row ->
+                val link = row.selectFirst("a[href]") ?: return@forEachIndexed
+                val href = HtmlImageExtractor.resolveUrl(pageBaseUri, link.attr("href")) ?: return@forEachIndexed
+                val rawTitle = row.selectFirst(".chapternum")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                    ?: link.text().trim().ifEmpty { "الفصل ${idx + 1}" }
+                val numMatch = Regex("""(\d+(\.\d+)?)""").find(rawTitle)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+                val dateText = row.selectFirst(".chapter-release-date, .chapterdate, span.date")?.text()?.trim().orEmpty()
+                val remoteSlug = href.trimEnd('/').substringAfterLast('/').ifBlank { "ch_$idx" }
+
+                rawList.add(
+                    MangaChapter(
+                        id = "${mangaId}_$remoteSlug",
+                        mangaId = mangaId,
+                        sourceId = id,
+                        remoteId = href,
+                        title = rawTitle,
+                        chapterNumber = numMatch ?: (rows.size - idx).toFloat(),
+                        uploadDate = System.currentTimeMillis() - idx * 36_000_000L,
+                        dateLabel = dateText.ifBlank { "متاح" }
+                    )
+                )
+            }
+        }
+
+        // Semantic fallback: find any <a href> on the details page that points to a chapter sub-path of pageBaseUri
+        if (rawList.isEmpty()) {
+            val baseWorkPrefix = pageBaseUri.trimEnd('/') + "/"
+            val subLinks = doc.select("a[href]")
+            var idx = 0
+            for (link in subLinks) {
+                val href = HtmlImageExtractor.resolveUrl(pageBaseUri, link.attr("href")) ?: continue
+                if (href.startsWith(baseWorkPrefix) && href.trimEnd('/') != pageBaseUri.trimEnd('/')) {
+                    idx++
+                    val rawTitle = link.text().trim().ifEmpty { link.attr("title").trim() }.ifEmpty { "الفصل $idx" }
+                    val slug = href.trimEnd('/').substringAfterLast('/')
+                    val numMatch = Regex("""(\d+(\.\d+)?)""").find(slug)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+                        ?: Regex("""(\d+(\.\d+)?)""").find(rawTitle)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+                    rawList.add(
+                        MangaChapter(
+                            id = "${mangaId}_$slug",
+                            mangaId = mangaId,
+                            sourceId = id,
+                            remoteId = href,
+                            title = rawTitle,
+                            chapterNumber = numMatch ?: idx.toFloat(),
+                            uploadDate = System.currentTimeMillis() - idx * 36_000_000L,
+                            dateLabel = "متاح"
+                        )
+                    )
+                }
+            }
+        }
+
+        return rawList
+            .distinctBy { "${it.sourceId}:${it.remoteId}" }
+            .sortedBy { it.chapterNumber ?: 0f }
+    }
+
+    /**
+     * Supports WordPress Madara asynchronous chapter endpoints:
+     * 1) POST {mangaUrl}/ajax/chapters/
+     * 2) POST {baseUrl}/wp-admin/admin-ajax.php (action=manga_get_chapters&manga={postId})
+     */
+    private suspend fun fetchAjaxMadaraChapters(
+        detailsHtml: String,
+        mangaUrl: String,
+        mangaId: String
+    ): List<MangaChapter> {
+        // 1. Try Madara 1.7+ direct /ajax/chapters/ POST
+        val ajaxUrl = "${mangaUrl.trimEnd('/')}/ajax/chapters/"
+        try {
+            val req = Request.Builder()
+                .url(ajaxUrl)
+                .post("".toRequestBody(null))
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/125.0.0.0 Mobile Safari/537.36")
+                .header("X-Requested-With", "XMLHttpRequest")
+                .header("Referer", mangaUrl)
+                .build()
+            val resp = withTimeoutOrNull(5_000L) { httpClient.newCall(req).awaitResponse() }
+            resp?.use { r ->
+                if (r.isSuccessful) {
+                    val ajaxHtml = r.body?.string().orEmpty()
+                    val parsed = parseChaptersFromDoc(Jsoup.parse(ajaxHtml, mangaUrl), mangaId, mangaUrl)
+                    if (parsed.isNotEmpty()) return parsed
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 2. Try Madara legacy admin-ajax.php with postId
+        val doc = Jsoup.parse(detailsHtml, mangaUrl)
+        val postId = doc.selectFirst("#manga-chapters-holder[data-id]")?.attr("data-id")?.trim()
+            ?: doc.selectFirst("input.rating-post-id[value]")?.attr("value")?.trim()
+        if (!postId.isNullOrBlank()) {
+            try {
+                val form = FormBody.Builder()
+                    .add("action", "manga_get_chapters")
+                    .add("manga", postId)
+                    .build()
+                val req = Request.Builder()
+                    .url("$baseUrl/wp-admin/admin-ajax.php")
+                    .post(form)
+                    .header("X-Requested-With", "XMLHttpRequest")
+                    .header("Referer", mangaUrl)
+                    .build()
+                val resp = withTimeoutOrNull(5_000L) { httpClient.newCall(req).awaitResponse() }
+                resp?.use { r ->
+                    if (r.isSuccessful) {
+                        val ajaxHtml = r.body?.string().orEmpty()
+                        val parsed = parseChaptersFromDoc(Jsoup.parse(ajaxHtml, mangaUrl), mangaId, mangaUrl)
+                        if (parsed.isNotEmpty()) return parsed
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        return emptyList()
+    }
+
+    // ─── LIVE MANGADEX REST API V5 BRIDGE ───
+
+    protected suspend fun fetchLiveManhwaFromApi(page: Int, searchQuery: String?): List<MangaSummary> {
+        val offset = ((page - 1).coerceAtLeast(0)) * 20
+        val apiUrl = if (!searchQuery.isNullOrBlank()) {
+            val encoded = URLEncoder.encode(searchQuery.trim(), "UTF-8")
+            "https://api.mangadex.org/manga?limit=20&offset=$offset&title=$encoded&includes[]=cover_art&includes[]=author&includes[]=artist&contentRating[]=safe&contentRating[]=suggestive&hasAvailableChapters=true"
+        } else {
+            "https://api.mangadex.org/manga?limit=20&offset=$offset&includes[]=cover_art&includes[]=author&includes[]=artist&contentRating[]=safe&contentRating[]=suggestive&hasAvailableChapters=true&$liveApiQueryParams"
+        }
+
+        return try {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_REQUEST_STARTED,
                 sourceId = id,
-                title = title,
-                alternativeTitles = fallbackSeed.altTitles,
-                coverUrl = cover,
-                description = desc,
-                author = author,
-                artist = fallbackSeed.artist,
-                status = status,
-                genres = genres,
-                rating = fallbackSeed.rating,
-                chapters = finalChapters
+                sourceName = name,
+                status = "API_REQUEST_STARTED",
+                details = "GET $apiUrl"
             )
-        }
-    }
+            val req = Request.Builder()
+                .url(apiUrl)
+                .header("User-Agent", "MangaReaderAndroid/2.0 (Kotlin; JetpackCompose)")
+                .header("Accept", "application/json")
+                .build()
 
-    private fun fetchLiveChapters(mangaUrl: String): List<MangaChapter> {
-        httpClient.newCall(buildGetRequest(mangaUrl)).execute().use { response ->
-            if (!response.isSuccessful) return emptyList()
-            val html = response.body?.string().orEmpty()
-            if (HtmlImageExtractor.isSecurityVerificationPage(html, response.code)) return emptyList()
-            val doc = Jsoup.parse(html, mangaUrl)
-            val slug = mangaUrl.trimEnd('/').substringAfterLast('/')
-            return parseChaptersFromDoc(doc, "${id}_$slug")
-        }
-    }
+            val response = withTimeoutOrNull(8_000L) {
+                httpClient.newCall(req).awaitResponse()
+            } ?: run {
+                PipelineLogger.log(
+                    stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                    sourceId = id,
+                    sourceName = name,
+                    status = "API_TIMEOUT",
+                    failureReason = "Timed out waiting for api.mangadex.org"
+                )
+                return emptyList()
+            }
 
-    private fun parseChaptersFromDoc(doc: Document, mangaId: String): List<MangaChapter> {
-        val rows = doc.select(chapterRowSelector)
-        if (rows.isEmpty()) return emptyList()
+            response.use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    PipelineLogger.log(
+                        stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                        sourceId = id,
+                        sourceName = name,
+                        status = "API_HTTP_${resp.code}",
+                        failureReason = "MangaDex API returned HTTP ${resp.code}"
+                    )
+                    return emptyList()
+                }
 
-        val rawList = rows.mapIndexedNotNull { idx, row ->
-            val link = row.selectFirst("a") ?: return@mapIndexedNotNull null
-            val href = HtmlImageExtractor.resolveUrl(baseUrl, link.attr("href")) ?: return@mapIndexedNotNull null
-            val rawTitle = link.text().trim().ifEmpty { "الفصل ${idx + 1}" }
-            val numMatch = Regex("""(\d+(\.\d+)?)""").find(rawTitle)?.groupValues?.getOrNull(1)?.toFloatOrNull()
-            val dateText = row.selectFirst(".chapter-release-date, .chapterdate, span.date")?.text()?.trim().orEmpty()
-            val remoteSlug = href.trimEnd('/').substringAfterLast('/').ifBlank { "ch_$idx" }
+                PipelineLogger.log(
+                    stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                    sourceId = id,
+                    sourceName = name,
+                    resultCount = body.length,
+                    status = "HTTP_200_JSON",
+                    details = "bytes=${body.length}"
+                )
 
-            MangaChapter(
-                id = "${mangaId}_$remoteSlug",
-                mangaId = mangaId,
+                PipelineLogger.log(
+                    stage = PipelineStage.PARSER_STARTED,
+                    sourceId = id,
+                    sourceName = name,
+                    status = "JSON_MANGADEX_V5"
+                )
+                val parsed = MangaDexApiHelper.parseMangaListResponse(body, sourceId = id)
+                PipelineLogger.log(
+                    stage = PipelineStage.PARSER_COMPLETED,
+                    sourceId = id,
+                    sourceName = name,
+                    resultCount = parsed.size,
+                    status = if (parsed.isNotEmpty()) "SUCCESS" else "EMPTY",
+                    failureReason = if (parsed.isEmpty()) "JSON data array returned 0 manga items" else null
+                )
+                parsed
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
                 sourceId = id,
-                remoteId = href,
-                title = rawTitle,
-                chapterNumber = numMatch ?: (rows.size - idx).toFloat(),
-                uploadDate = System.currentTimeMillis() - idx * 36_000_000L,
-                dateLabel = dateText.ifBlank { "منذ قليل" }
+                sourceName = name,
+                status = "API_FAILED",
+                failureReason = "${e.javaClass.simpleName}: ${e.message}",
+                throwable = e
             )
-        }.distinctBy { "${it.sourceId}:${it.remoteId}" }
-
-        return rawList.sortedBy { it.chapterNumber ?: 0f }
+            emptyList()
+        }
     }
 
-    private fun fetchLiveChapterPages(chapterUrl: String): List<MangaPage> {
-        httpClient.newCall(buildGetRequest(chapterUrl)).execute().use { response ->
-            if (!response.isSuccessful) return emptyList()
-            val html = response.body?.string().orEmpty()
-            if (HtmlImageExtractor.isSecurityVerificationPage(html, response.code)) return emptyList()
-            return HtmlImageExtractor.extractChapterPagesFromHtml(html, chapterUrl, readerImagesSelector)
+    protected suspend fun fetchLiveMangaDexDetails(mdUuid: String): MangaDetails? {
+        val detailsUrl = "https://api.mangadex.org/manga/$mdUuid?includes[]=cover_art&includes[]=author&includes[]=artist"
+        val chapters = fetchLiveMangaDexChapters(mdUuid, "${id}_$mdUuid")
+
+        return try {
+            val req = Request.Builder()
+                .url(detailsUrl)
+                .header("User-Agent", "MangaReaderAndroid/2.0")
+                .header("Accept", "application/json")
+                .build()
+            val response = withTimeoutOrNull(7_000L) {
+                httpClient.newCall(req).awaitResponse()
+            } ?: return null
+
+            response.use { resp ->
+                if (!resp.isSuccessful) return null
+                val json = resp.body?.string().orEmpty()
+                MangaDexApiHelper.parseMangaSingleDetailsResponse(
+                    jsonString = json,
+                    sourceId = id,
+                    chapters = chapters
+                )
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "MD_DETAILS_FAILED",
+                failureReason = e.message,
+                throwable = e
+            )
+            null
         }
+    }
+
+    protected suspend fun fetchLiveMangaDexChapters(mdUuid: String, mangaId: String): List<MangaChapter> {
+        val feedUrl = "https://api.mangadex.org/manga/$mdUuid/feed?limit=96&offset=0&translatedLanguage[]=ar&translatedLanguage[]=en&order[chapter]=asc&includeExternalUrl=0&contentRating[]=safe&contentRating[]=suggestive"
+        return try {
+            val req = Request.Builder()
+                .url(feedUrl)
+                .header("User-Agent", "MangaReaderAndroid/2.0")
+                .header("Accept", "application/json")
+                .build()
+            val response = withTimeoutOrNull(7_000L) {
+                httpClient.newCall(req).awaitResponse()
+            } ?: return emptyList()
+
+            response.use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                val json = resp.body?.string().orEmpty()
+                val list = MangaDexApiHelper.parseChaptersFeedResponse(json, mangaId = mangaId, sourceId = id)
+                if (list.isNotEmpty()) {
+                    list
+                } else {
+                    // Fallback to all languages if no ar/en chapters exist for this work
+                    val anyLangUrl = "https://api.mangadex.org/manga/$mdUuid/feed?limit=50&offset=0&order[chapter]=asc&includeExternalUrl=0"
+                    val fallbackReq = Request.Builder()
+                        .url(anyLangUrl)
+                        .header("User-Agent", "MangaReaderAndroid/2.0")
+                        .build()
+                    val fallbackResp = withTimeoutOrNull(6_000L) {
+                        httpClient.newCall(fallbackReq).awaitResponse()
+                    }
+                    fallbackResp?.use { r2 ->
+                        if (r2.isSuccessful) {
+                            MangaDexApiHelper.parseChaptersFeedResponse(
+                                r2.body?.string().orEmpty(),
+                                mangaId = mangaId,
+                                sourceId = id
+                            )
+                        } else emptyList()
+                    } ?: emptyList()
+                }
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "MD_CHAPTERS_FAILED",
+                failureReason = e.message,
+                throwable = e
+            )
+            emptyList()
+        }
+    }
+
+    protected suspend fun fetchLiveMangaDexPages(atHomeUrl: String): List<MangaPage> {
+        return try {
+            val req = Request.Builder()
+                .url(atHomeUrl)
+                .header("User-Agent", "MangaReaderAndroid/2.0")
+                .header("Accept", "application/json")
+                .build()
+            val response = withTimeoutOrNull(8_000L) {
+                httpClient.newCall(req).awaitResponse()
+            } ?: return emptyList()
+
+            response.use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                val json = resp.body?.string().orEmpty()
+                MangaDexApiHelper.parseAtHomePagesResponse(json)
+            }
+        } catch (e: Exception) {
+            PipelineLogger.log(
+                stage = PipelineStage.NETWORK_RESPONSE_RECEIVED,
+                sourceId = id,
+                sourceName = name,
+                status = "MD_PAGES_FAILED",
+                failureReason = e.message,
+                throwable = e
+            )
+            emptyList()
+        }
+    }
+
+    protected fun extractMangaDexUuid(urlOrId: String): String? {
+        val uuidRegex = Regex("""([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})""")
+        return uuidRegex.find(urlOrId)?.groupValues?.getOrNull(1)
     }
 }
 
 /**
- * 1. Mangalek Source (مانجا ليك Mangalek - mangalik.net) — WordPress Madara architecture
+ * 1. Mangalek Source (مانجا ليك Mangalek - mangalik.net) — WordPress Madara + Korean Manhwa feed
  */
 class MangalekSource : ConfigurableHtmlMangaSource(
     id = "mangalek",
@@ -392,6 +1068,7 @@ class MangalekSource : ConfigurableHtmlMangaSource(
     iconText = "M",
     iconColorHex = 0xFFD32F2F,
     requiresCloudflareVerification = false,
+    mirrorDomains = listOf("lekmanga.net"),
     itemSelector = "div.page-item-detail, div.c-tabs-item__content",
     titleSelector = ".post-title h3 a, .post-title a, h3 a",
     coverSelector = ".item-thumb, .tab-thumb",
@@ -403,154 +1080,11 @@ class MangalekSource : ConfigurableHtmlMangaSource(
     detailsStatusSelector = ".post-status .summary-content",
     chapterRowSelector = "li.wp-manga-chapter",
     readerImagesSelector = ".reading-content img, .page-break img, img.wp-manga-chapter-img",
-    catalogItems = listOf(
-        CatalogSeedItem(
-            id = "murim_psychopath",
-            title = "Murim Psychopath",
-            altTitles = listOf("مجنون عالم الموريم", "싸이코패스 무림"),
-            coverUrl = "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=500&q=80",
-            genres = listOf("اكشن", "بطل غير اعتيادي", "دراما", "دموي", "غموض", "فانتازيا", "فنون قتالية"),
-            status = "OnGoing",
-            rating = 4.7f,
-            author = "Tigers Studio",
-            artist = "Kirose",
-            chapterCount = 50,
-            description = "من تأليف الكاتب الذي قدم لكم عمل ومن إنتاج الاستوديو الذي قدم لكم عمل — [مرحباً بك في عالم الموريم الافتراضي، حيث لا بقاء إلا للأقوياء!] وقع عطب في جهازك، وقد أخفقت محاولة تسجيل الخروج! بينما يسعى جاهداً للعودة إلى كنف الواقع الافتراضي، إذا به يجد نفسه في مواجهة قتالية حاسمة.",
-            sampleDialogues = listOf(
-                "إنه قـــادم!! خذوا مواقعكم!!",
-                "مهلاً، هناك من يقترب من البوابة الشمالية.",
-                "تنبيه طارئ من النظام: لقد استهلك القراء أجزاء الفصول بمعدل قياسي!",
-                "في عالم الموريم لا مكان للتردد... السيف وحده يحكم!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "ceres_time_healer",
-            title = "Ceres, the Time Healer",
-            altTitles = listOf("سيريس معالجة الزمن", "시간치료사 세레스"),
-            coverUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=500&q=80",
-            genres = listOf("تجسيد", "خارق للطبيعة", "رومانسي", "سحر", "كوميدي", "هوس"),
-            status = "OnGoing",
-            rating = 4.0f,
-            author = "Elysia Novel",
-            artist = "Studio Time",
-            chapterCount = 33,
-            description = "غريس إليسيا، آنسة عائلة إليسيا الكونتية، التي لُقبت بالقديسة والشيطانة في آنٍ واحد بسبب قدرتها الغامضة على إعادة الزمن. رغم أنها أنقذت أعداداً لا تحصى من البشر في هذا العالم، إلا أنها لم تستطع علاج مرضها هي. وفقط قبل أن تلفظ أنفاسها الأخيرة جراء مرضها العضال، كان يساورها قلق أخير واحد!",
-            sampleDialogues = listOf(
-                "خذوا الأطفال واهربوا! لا تلتفتوا إلى الوراء!",
-                "ولكن... أنا متعبة، أريد فقط أن أرتاح بعد كل هذه السنين.",
-                "أهذا هو المكان الذي سأعيش فيه من الآن فصاعداً؟",
-                "لقد عاد الزمن مرة أخرى... وهذه المرة سأغير المصير!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "overgeared",
-            title = "Overgeared",
-            altTitles = listOf("المدجج بالعتاد", "템빨"),
-            coverUrl = "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&q=80",
-            genres = listOf("اكشن", "خيال", "كوميدي", "مغامرة", "ويب تون", "إيسيكاي"),
-            status = "OnGoing",
-            rating = 4.9f,
-            author = "Park Saenal",
-            artist = "Redice Studio",
-            chapterCount = 64,
-            description = "شين يونغوو شاب غير محظوظ في الحياة الواقعية، يجد أثناء مهمة صعبة في لعبة الواقع الافتراضي الشهيرة كتاباً أسطورياً يحوله إلى سليل الحدّاد الأسطوري باجما، ليبدأ بصناعة أقوى الأسلحة والدروع التي تغير توازن العالم.",
-            sampleDialogues = listOf(
-                "تم تفعيل مهارة الحداد الأسطوري: صناعة نصل التنين!",
-                "هل تظن أن درعاً عادياً يمكنه صد هذه الضربة؟",
-                "خصائص الأداة الجديدة تجاوزت التصنيف الأسطوري!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "after_resignation",
-            title = "After Resignation, I Met the Obsessive Male Lead",
-            altTitles = listOf("بعد الاستقالة", "퇴사 후 집착 남주를 만났다"),
-            coverUrl = "https://images.unsplash.com/photo-1541701494587-cb58502866ab?w=500&q=80",
-            genres = listOf("دراما", "رومانسي", "فانتازيا", "شوجو"),
-            status = "OnGoing",
-            rating = 4.5f,
-            author = "Han Seo",
-            artist = "Yuna Art",
-            chapterCount = 26,
-            description = "في حياتها السابقة، كانت موظفة كورية مرهقة. في هذه الحياة، تُعين في قسم هادئ ومريح، على أمل أن تُنجز عملها بسهولة وتتقاضى راتباً دون عناء... هل هذا ما يحدث عندما تأتي موظفة جديدة بخبرة سابقة؟!",
-            sampleDialogues = listOf(
-                "قدمـت استقالتي للحصول على الراحة، فلماذا يلاحقني القائد الأعلى؟!",
-                "هذا التقرير تم إنجازه في عشر دقائق فقط؟ مذهل!",
-                "لن أعمل لساعات إضافية مهما كان الثمن!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "unexpected_romance",
-            title = "Unexpected romance",
-            altTitles = listOf("رومانسية غير متوقعة"),
-            coverUrl = "https://images.unsplash.com/photo-1516589178581-6cd7833ae3b2?w=500&q=80",
-            genres = listOf("دراما", "رومانسي", "الحياة المدرسية", "كوميدي", "ويب تون"),
-            status = "OnGoing",
-            rating = 4.4f,
-            author = "MinJi",
-            artist = "Sora",
-            chapterCount = 40,
-            description = "قصة دافئة تجمع بين طالبين في أكاديمية النخبة يكتشفان أن المصادفات اليومية تخفي وراءها أسراراً قديمة تغير نظرتهما للمستقبل.",
-            sampleDialogues = listOf(
-                "لم أكن أتوقع رؤيتك في المكتبة في هذا الوقت المتأخر.",
-                "هل هذا الدفتر يخصك؟ لقد وجدته قرب القاعة الرئيسية."
-            )
-        ),
-        CatalogSeedItem(
-            id = "an_extra_who_wants_to_escape",
-            title = "An Extra Who Wants to Escape the Obsessive Male Lead",
-            altTitles = listOf("شخصية ثانوية تريد الهروب"),
-            coverUrl = "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=500&q=80",
-            genres = listOf("دراما", "رومانسي", "زمكاني", "فانتازيا", "مانهوا", "إيسيكاي"),
-            status = "OnGoing",
-            rating = 4.3f,
-            author = "Claire",
-            artist = "Luna",
-            chapterCount = 51,
-            description = "استيقظتُ داخل رواية خيالية كشخصية ثانوية لا يذكرها أحد، وكان هدفي الوحيد الابتعاد عن الأحداث الرئيسية والعيش بسلام في الريف، لكن البطل الرئيسي للرواية بدأ يغير مسار القصة بالكامل!",
-            sampleDialogues = listOf(
-                "أنا مجرد شخصية ثانوية في هذه الرواية، لماذا تتغير الأحداث؟",
-                "عربة السفر جاهزة يا آنستي، علينا المغادرة قبل الفجر."
-            )
-        ),
-        CatalogSeedItem(
-            id = "how_to_survive_academy",
-            title = "How to Survive at the Academy",
-            altTitles = listOf("كيف أنجو في الأكاديمية"),
-            coverUrl = "https://images.unsplash.com/photo-1511512578047-dfb367046420?w=500&q=80",
-            genres = listOf("اكشن", "فانتازيا", "مغامرة", "إيسيكاي", "إدارة المناطق"),
-            status = "OnGoing",
-            rating = 4.8f,
-            author = "Korakoram",
-            artist = "Green Kyrin",
-            chapterCount = 75,
-            description = "يجد الكاتب نفسه متجسداً في شخصية إد روثتايلور المنبوذ داخل أكاديمية سيلفينيا، وعليه استخدام معرفته الدقيقة بكل أسرار العالم للبقاء على قيد الحياة في الغابة الشمالية والتخرج بسلام.",
-            sampleDialogues = listOf(
-                "بناء المخيم في الغابة الشمالية هو خطوتي الأولى للبقاء.",
-                "الأرواح العنصرية تستجيب لتعويذة الرياح المتقدمة!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "surviving_in_another_world",
-            title = "Surviving In Another World",
-            altTitles = listOf("البقاء في عالم آخر"),
-            coverUrl = "https://images.unsplash.com/photo-1563089145-599997674d42?w=500&q=80",
-            genres = listOf("إيسيكاي", "اكشن", "مغامرة", "فانتازيا", "ابراج"),
-            status = "OnGoing",
-            rating = 5.0f,
-            author = "Orc Master",
-            artist = "Studio Apex",
-            chapterCount = 38,
-            description = "محارب مخضرم ينتقل إلى عالم موازٍ مليء بالأبراج المحصنة والوحوش الأسطورية، حيث يعتمد على خبرته التكتيكية لتكوين تحالفات غير متوقعة.",
-            sampleDialogues = listOf(
-                "الطابق العشرون من البرج يفتح أبوابه الآن!",
-                "تشكيل الدفاع الدائري فوراً!"
-            )
-        )
-    )
+    liveApiQueryParams = "originalLanguage[]=ko&order[followedCount]=desc"
 )
 
 /**
- * 2. Team-X Source (olympustaff.com) — Custom MangaStream / Olympus theme selectors
+ * 2. Team-X Source (Team-X - olympustaff.com) — MangaStream / Action & Martial Arts Manhwa
  */
 class TeamXSource : ConfigurableHtmlMangaSource(
     id = "teamx",
@@ -559,8 +1093,8 @@ class TeamXSource : ConfigurableHtmlMangaSource(
     iconText = "X",
     iconColorHex = 0xFF1E293B,
     requiresCloudflareVerification = false,
-    itemSelector = "div.bsx, div.utao, div.page-item-detail",
-    titleSelector = "a[title], .tt, h3 a",
+    itemSelector = "div.bsx, div.utao, div.page-item-detail, div.box",
+    titleSelector = ".tt, h3 a, a[title]",
     coverSelector = ".limit, .imgu, .item-thumb",
     latestChapterSelector = ".epxs, .adds .epxs, .chapter a",
     detailsTitleSelector = "h1.entry-title, .author-info-title h1",
@@ -570,73 +1104,27 @@ class TeamXSource : ConfigurableHtmlMangaSource(
     detailsStatusSelector = ".tsinfo .imptdt:contains(الحالة) i, .post-status",
     chapterRowSelector = "#chapterlist li, .eplister ul li, li.wp-manga-chapter",
     readerImagesSelector = "#readerarea img, .reading-content img, .page-break img",
-    catalogItems = listOf(
-        CatalogSeedItem(
-            id = "took_over_academy_sashimi",
-            title = "I Took Over The Academy With a Single Sashimi Knife",
-            altTitles = listOf("سيطرت على الأكاديمية بسكين واحد"),
-            coverUrl = "https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=500&q=80",
-            genres = listOf("اكشن", "فانتازيا", "فنون قتالية", "إيسيكاي", "الحياة المدرسية"),
-            status = "OnGoing",
-            rating = 4.9f,
-            author = "Tigers Team",
-            artist = "Hitbook Studio",
-            chapterCount = 45,
-            description = "استيقظ كيم ووجين، مطور الألعاب في شركة REW، ليجد نفسه قد أصبح هو جيونغين داخل عالم اللعبة التي كان يصممها! إذا كان السيف هو قدره فسوف يحرك هذا القدر بنفسه ليبقى على قيد الحياة.",
-            sampleDialogues = listOf(
-                "مهارة التقطيع الدقيق تتجاوز حدود السيوف التقليدية!",
-                "مرحباً أعزائي القراء في فصل جديد من ترجمة فريق تايجرز!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "return_mount_hua",
-            title = "Return of the Mount Hua Sect",
-            altTitles = listOf("عودة طائفة جبل هوا"),
-            coverUrl = "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=500&q=80",
-            genres = listOf("اكشن", "فنون قتالية", "كوميدي", "تاريخي", "مغامرة"),
-            status = "OnGoing",
-            rating = 4.9f,
-            author = "Biga",
-            artist = "LICO",
-            chapterCount = 112,
-            description = "تشونغ ميونغ، قديس سيف زهرة البرقوق الثالث عشر، يعود إلى الحياة بعد مئة عام من معركته الأخيرة ليجد طائفة جبل هوا العريقة قد فقدت مجدها، فيقرر إعادة بنائها من الصفر بطريقته الخاصة.",
-            sampleDialogues = listOf(
-                "تلميذة جبل هوا: بداية تجنن وتدريب لا يرحم!",
-                "سيف زهرة البرقوق سيزهر من جديد فوق القمم!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "nano_machine",
-            title = "Nano Machine",
-            altTitles = listOf("آلة النانو"),
-            coverUrl = "https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=500&q=80",
-            genres = listOf("اكشن", "فنون قتالية", "خيال علمي", "انتقام"),
-            status = "OnGoing",
-            rating = 4.8f,
-            author = "Han-Joong-Wol-Ya",
-            artist = "Geum-Gang-Bul-Gae",
-            chapterCount = 95,
-            description = "بعد تعرضه لمحاولة اغتيال، يتلقى تشون يو-وون تقنية نانو متطورة من أحد أحفاده القادمين من المستقبل، لتندمج مع جسده وتمنحه قدرات تحليل وقتال غير مسبوقة في أكاديمية الموريم.",
-            sampleDialogues = listOf(
-                "تم تفعيل نظام النانو من الجيل السابع: جاري مسح تقنية الخصم...",
-                "معدل التوافق مع الطاقة الداخلية وصل إلى 100%!"
-            )
-        )
-    )
-)
+    liveApiQueryParams = "originalLanguage[]=ko&originalLanguage[]=zh&order[rating]=desc"
+) {
+    override fun buildPopularUrl(page: Int, hostBaseUrl: String): String {
+        return if (page <= 1) "$hostBaseUrl/" else "$hostBaseUrl/series?page=$page"
+    }
+}
 
 /**
  * 3. Mangatek Source (مانجاتك - Mangatek - mangatek.com)
  */
-class MangatekSource : ConfigurableHtmlMangaSource(
+class MangatekSource(
+    requiresVerificationOverride: Boolean = false
+) : ConfigurableHtmlMangaSource(
     id = "mangatek",
     name = "مانجاتك - Mangatek",
     domain = "mangatek.com",
     iconText = "M",
     iconColorHex = 0xFF3949AB,
-    requiresCloudflareVerification = true,
+    requiresCloudflareVerification = requiresVerificationOverride,
     itemSelector = "div.manga-item, div.bsx, div.page-item-detail",
-    titleSelector = "h3 a, .post-title a, a[title]",
+    titleSelector = "h3 a, .post-title a, .tt, a[title]",
     coverSelector = ".manga-poster, .limit, .item-thumb",
     latestChapterSelector = ".chapter a, .epxs",
     detailsTitleSelector = "h1.post-title, h1.entry-title",
@@ -646,102 +1134,11 @@ class MangatekSource : ConfigurableHtmlMangaSource(
     detailsStatusSelector = ".post-status .summary-content",
     chapterRowSelector = "li.wp-manga-chapter, #chapterlist li",
     readerImagesSelector = ".reading-content img, #readerarea img",
-    catalogItems = listOf(
-        CatalogSeedItem(
-            id = "what_death_taught_me",
-            title = "What Death Taught Me",
-            altTitles = listOf("ما علمني إياه الموت"),
-            coverUrl = "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=500&q=80",
-            genres = listOf("دراما", "رومانسي", "شوجو", "مانهوا", "فانتازيا"),
-            status = "Completed",
-            rating = 4.3f,
-            author = "Dilar Studio",
-            artist = "Monarch Team",
-            chapterCount = 52,
-            description = "قاتل أمي، الذي ترك ندوباً على وجهي إلى الأبد، بل وسرق خطيبي — كاتيا! هذه المرة، سأستعيد كل شيء. لكن فكرة إعادة كتابة الماضي لم تكن أكثر من غطرسة مني... تبدأ معركة لا هوادة فيها.",
-            sampleDialogues = listOf(
-                "لقد كان حرقهم على التل مشهداً لا يُنسى...",
-                "أرغوس، لقد أحضرتُ ما طلبته في الموعد المحدد.",
-                "ولكن أولاً، ينبغي علينا أن نبدأ في الاحتفال بعودة الحق!",
-                "يا آنستي، حسناً إذاً، يجب أن أذهب الآن..."
-            )
-        ),
-        CatalogSeedItem(
-            id = "logging_10000_years",
-            title = "Logging 10,000 Years into the Future",
-            altTitles = listOf("تسجيل الدخول لعشرة آلاف سنة في المستقبل"),
-            coverUrl = "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&q=80",
-            genres = listOf("أكشن", "شوينن", "فانتازيا", "فنون قتالية", "مغامرة"),
-            status = "OnGoing",
-            rating = 4.7f,
-            author = "Ozul Scans",
-            artist = "Poxer Studio",
-            chapterCount = 372,
-            description = "في فجر ثورة في عصر فنون الدفاع عن النفس، تبدأ جحافل من الوحوش المرعبة بغزو العالم، وهزيمة محاربي البشرية واحداً تلو الآخر، حتى يكتشف لو شينغ قدرة الدخول إلى المستقبل لعشرة آلاف عام.",
-            sampleDialogues = listOf(
-                "فقط لندرك أننا كنا في عالم أوسع مما تخيلنا!",
-                "تم نسخ تقنية التنفس القتالي من سجلات المستقبل!",
-                "المستوى القتالي الحالي تجاوز تصنيف القائد الأعلى!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "mysterious_young_master",
-            title = "The Mysterious Young Master",
-            altTitles = listOf("السيد الشاب الغامض"),
-            coverUrl = "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=500&q=80",
-            genres = listOf("أكشن", "إثارة", "فنون قتالية", "تاريخي"),
-            status = "OnGoing",
-            rating = 4.6f,
-            author = "Murim Chronicle",
-            artist = "Cloud Ink",
-            chapterCount = 37,
-            description = "بعد أن فقدت عشيرة ماندوريم مجدها إثر تورطها في الحرب العظمى، يعود إليها حفيد زعيمها الأكبر، شاب يبدو كطالب علم مسالم، لكنه في الحقيقة ملك الجبال بلا منازع، أحد أعظم عشرة خبراء في العالم.",
-            sampleDialogues = listOf(
-                "هل تتذكر كيف كانت إيل-رين في طفولتها؟",
-                "يزعم بعض المحاربين أنه نعمة من السماء، لكن الحقيقة أعمق.",
-                "أجل، إنه الندم الوحيد الذي يلازمني منذ تلك المعركة.",
-                "غير أن هذه الطاقة تتسبب تدريجياً في إعادة تشكيل المسارات!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "solo_max_level_newbie",
-            title = "Solo Max-Level Newbie",
-            altTitles = listOf("مبتدئ بالمستوى الأقصى"),
-            coverUrl = "https://images.unsplash.com/photo-1563089145-599997674d42?w=500&q=80",
-            genres = listOf("أكشن", "خيال", "مغامرة", "ابراج"),
-            status = "OnGoing",
-            rating = 4.8f,
-            author = "Maslow",
-            artist = "Swingbat",
-            chapterCount = 140,
-            description = "جينهيوك، اللاعب الوحيد الذي أنهى برج التجارب المستحيل في اللعبة، يجد أن البرج قد أصبح حقيقة واقعة في العالم، ليستخدم معرفته بكل الطوابق السرية للوصول إلى القمة.",
-            sampleDialogues = listOf(
-                "أنا الوحيد الذي يعرف الممر السري في الطابق الأول!",
-                "تم الحصول على المهارة الفريدة بنجاح!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "peerless_battle_spirit",
-            title = "Peerless Battle Spirit",
-            altTitles = listOf("روح القتال المنقطعة النظير"),
-            coverUrl = "https://images.unsplash.com/photo-1511512578047-dfb367046420?w=500&q=80",
-            genres = listOf("أكشن", "خيال", "فنون قتالية", "مغامرة"),
-            status = "OnGoing",
-            rating = 4.5f,
-            author = "jiuce",
-            artist = "jiuce art",
-            chapterCount = 88,
-            description = "في قارة تسانغلان، حيث تحدد الروح القتالية مصير المحاربين، يوقظ تشين نان روحاً قتالية قادرة على التطور بلا حدود.",
-            sampleDialogues = listOf(
-                "الروح القتالية الإلهية تستيقظ الآن!",
-                "لن يقف أحد في طريق صعودي إلى القمة!"
-            )
-        )
-    )
+    liveApiQueryParams = "originalLanguage[]=ko&order[latestUploadedChapter]=desc"
 )
 
 /**
- * 4. Azora Manga Source (ازورا مانجا - Azora Manga - azoramanga.com)
+ * 4. Azora Manga Source (ازورا مانجا - Azora Manga - azoramanga.com / azoramoon.com)
  */
 class AzoraMangaSource : ConfigurableHtmlMangaSource(
     id = "azora",
@@ -750,8 +1147,9 @@ class AzoraMangaSource : ConfigurableHtmlMangaSource(
     iconText = "A",
     iconColorHex = 0xFFFB8C00,
     requiresCloudflareVerification = false,
+    mirrorDomains = listOf("azoramoon.com"),
     itemSelector = "div.page-item-detail, div.bsx",
-    titleSelector = ".post-title h3 a, .post-title a, a[title]",
+    titleSelector = ".post-title h3 a, .post-title a, .tt, a[title]",
     coverSelector = ".item-thumb, .limit",
     latestChapterSelector = ".chapter-item:first-child .chapter a, .epxs",
     detailsTitleSelector = ".post-title h1",
@@ -761,47 +1159,20 @@ class AzoraMangaSource : ConfigurableHtmlMangaSource(
     detailsStatusSelector = ".post-status .summary-content",
     chapterRowSelector = "li.wp-manga-chapter",
     readerImagesSelector = ".reading-content img, .page-break img",
-    catalogItems = listOf(
-        CatalogSeedItem(
-            id = "magic_emperor",
-            title = "Magic Emperor",
-            altTitles = listOf("إمبراطور السحر", "مدير عائلة لو"),
-            coverUrl = "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=500&q=80",
-            genres = listOf("أكشن", "خيال", "فنون قتالية", "بطل غير اعتيادي"),
-            status = "OnGoing",
-            rating = 4.9f,
-            author = "Nightingale",
-            artist = "Wuer Manhua",
-            chapterCount = 120,
-            description = "تشو ييفان، الإمبراطور القديم الذي يمتلك سجل الأباطرة التسعة، يتجسد في جسد كبير خدم عائلة متواضعة، ليقودها بدهائه الاستراتيجي إلى قمة الإمبراطورية.",
-            sampleDialogues = listOf(
-                "عائلة لو ستصبح القوة الأولى في هذه الإمبراطورية!",
-                "خطتك مكشوفة منذ البداية أيها الشيخ!"
-            )
-        ),
-        CatalogSeedItem(
-            id = "the_beginning_after_the_end",
-            title = "The Beginning After The End",
-            altTitles = listOf("البداية بعد النهاية"),
-            coverUrl = "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&q=80",
-            genres = listOf("أكشن", "فانتازيا", "إيسيكاي", "سحر", "مغامرة"),
-            status = "OnGoing",
-            rating = 4.9f,
-            author = "TurtleMe",
-            artist = "Fuyuki23",
-            chapterCount = 175,
-            description = "الملك غراي يولد من جديد كآرثر ليوين في عالم قارة ديكاثين المليء بالسحر والتنانين، حاملاً حكمة حياته السابقة لحماية عائلته الجديدة.",
-            sampleDialogues = listOf(
-                "نواة المانا الخاصة بي وصلت إلى المرحلة الفضية!",
-                "سأحمي عائلتي مهما كلف الأمر!"
-            )
-        )
-    )
-)
+    liveApiQueryParams = "originalLanguage[]=ko&order[createdAt]=desc"
+) {
+    override fun buildCandidatePopularUrls(page: Int): List<String> {
+        return if (page <= 1) {
+            listOf("https://azoramoon.com/", "https://azoramoon.com/series/", "$baseUrl/manga/")
+        } else {
+            listOf("https://azoramoon.com/series/?page=$page", "$baseUrl/manga/page/$page/")
+        }
+    }
+}
 
 /**
  * 5. Official MangaDex Public REST API v5 Connector (mangadex.org)
- * Uses https://api.mangadex.org/manga?includes[]=cover_art for real JSON API extraction.
+ * Uses https://api.mangadex.org/manga directly for catalog, search, details, chapters, and pages.
  */
 class MangaDexSource : ConfigurableHtmlMangaSource(
     id = "mangadex",
@@ -821,86 +1192,20 @@ class MangaDexSource : ConfigurableHtmlMangaSource(
     detailsStatusSelector = ".status",
     chapterRowSelector = ".chapter-row",
     readerImagesSelector = "img",
-    catalogItems = listOf(
-        CatalogSeedItem(
-            id = "omniscient_reader",
-            title = "Omniscient Reader's Viewpoint",
-            altTitles = listOf("وجهة نظر القارئ الشامل"),
-            coverUrl = "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&q=80",
-            genres = listOf("أكشن", "فانتازيا", "مغامرة", "إثارة"),
-            status = "OnGoing",
-            rating = 4.95f,
-            author = "Sing N Song",
-            artist = "Sleepy-C",
-            chapterCount = 90,
-            description = "كيم دوكجا هو القارئ الوحيد الذي أكمل قراءة رواية استمرت عشر سنوات، وعندما تتحول الرواية إلى واقع، يصبح هو الشخص الوحيد الذي يعرف نهاية العالم.",
-            sampleDialogues = listOf(
-                "تم تفعيل المهارة الحصرية: وجهة نظر القارئ الشامل!",
-                "السيناريو الرئيسي الأول يبدأ الآن!"
-            )
-        )
-    )
+    liveApiQueryParams = "originalLanguage[]=ko&originalLanguage[]=ja&availableTranslatedLanguage[]=ar&availableTranslatedLanguage[]=en&order[followedCount]=desc"
 ) {
     override suspend fun getPopular(page: Int): PageResult<MangaSummary> = withContext(Dispatchers.IO) {
-        val offset = ((page - 1).coerceAtLeast(0)) * 12
-        val apiUrl = "https://api.mangadex.org/manga?limit=12&offset=$offset&includes[]=cover_art&contentRating[]=safe&order[followedCount]=desc"
-        val apiItems = withTimeoutOrNull(6_000L) {
-            runCatching {
-                val req = Request.Builder()
-                    .url(apiUrl)
-                    .header("User-Agent", "MangaReaderAndroid/2.0")
-                    .build()
-                httpClient.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use emptyList<MangaSummary>()
-                    val root = JSONObject(resp.body?.string().orEmpty())
-                    val dataArr = root.optJSONArray("data") ?: return@use emptyList<MangaSummary>()
-                    val list = mutableListOf<MangaSummary>()
-                    for (i in 0 until dataArr.length()) {
-                        val obj = dataArr.getJSONObject(i)
-                        val mdId = obj.getString("id")
-                        val attrs = obj.getJSONObject("attributes")
-                        val titleObj = attrs.optJSONObject("title")
-                        val title = titleObj?.optString("en")?.ifBlank { null }
-                            ?: titleObj?.keys()?.asSequence()?.firstOrNull()?.let { titleObj.optString(it) }
-                            ?: "MangaDex Work"
-                        var coverFileName: String? = null
-                        val rels = obj.optJSONArray("relationships")
-                        if (rels != null) {
-                            for (r in 0 until rels.length()) {
-                                val rel = rels.getJSONObject(r)
-                                if (rel.optString("type") == "cover_art") {
-                                    coverFileName = rel.optJSONObject("attributes")?.optString("fileName")
-                                }
-                            }
-                        }
-                        val coverUrl = if (!coverFileName.isNullOrBlank()) {
-                            "https://uploads.mangadex.org/covers/$mdId/$coverFileName.256.jpg"
-                        } else {
-                            catalogItems.first().coverUrl
-                        }
-                        list.add(
-                            MangaSummary(
-                                id = "mangadex_$mdId",
-                                sourceId = id,
-                                title = title,
-                                coverUrl = coverUrl,
-                                mangaUrl = "https://mangadex.org/title/$mdId",
-                                latestChapter = "متاح",
-                                genres = listOf("مانهوا", "أكشن"),
-                                rating = 4.8f,
-                                status = attrs.optString("status", "ongoing").replaceFirstChar { it.titlecase(Locale.ROOT) }
-                            )
-                        )
-                    }
-                    list
-                }
-            }.getOrNull()
+        val items = fetchLiveManhwaFromApi(page = page, searchQuery = null)
+        if (items.isEmpty()) {
+            throw IllegalStateException("تعذّر جلب الأعمال من واجهة MangaDex الرسمية")
         }
+        PageResult(items = items, page = page, hasNextPage = true)
+    }
 
-        if (!apiItems.isNullOrEmpty()) {
-            PageResult(items = apiItems, page = page, hasNextPage = true)
-        } else {
-            super.getPopular(page)
-        }
+    override suspend fun search(query: String, page: Int): PageResult<MangaSummary> = withContext(Dispatchers.IO) {
+        val clean = query.trim()
+        if (clean.isEmpty()) return@withContext getPopular(page)
+        val items = fetchLiveManhwaFromApi(page = page, searchQuery = clean)
+        PageResult(items = items, page = page, hasNextPage = false)
     }
 }

@@ -3,13 +3,23 @@ package com.example.features
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.core.common.PipelineLogger
+import com.example.core.common.PipelineStage
 import com.example.core.database.MangaDatabase
 import com.example.core.downloads.DownloadEngine
 import com.example.core.storage.AppPreferences
 import com.example.core.storage.LocalChapterStorage
 import com.example.core.storage.StorageStats
 import com.example.core.storage.UserSettings
+import com.example.core.verification.VerificationDetector
+import com.example.core.verification.VerificationManager
+import com.example.core.verification.VerificationRepository
+import com.example.core.verification.VerificationRequiredException
+import com.example.core.verification.VerificationSession
+import com.example.core.verification.VerificationSessionManager
+import com.example.core.verification.VerificationState
 import com.example.data.repositories.MangaRepository
+import com.example.data.repositories.SourceRepository
 import com.example.domain.models.AppThemeStyle
 import com.example.domain.models.DownloadTask
 import com.example.domain.models.GridDisplayMode
@@ -22,6 +32,7 @@ import com.example.domain.models.SortOption
 import com.example.domain.models.SourceInfo
 import com.example.domain.models.SourceStatus
 import com.example.domain.models.StatusFilter
+import com.example.sourceapi.SourceManager
 import com.example.sourceapi.SourceRegistry
 import com.example.sourceapi.SourceValidationStepResult
 import com.example.sourceapi.SourceValidator
@@ -73,10 +84,13 @@ data class AddSiteDialogState(
     val pendingValidationResult: SourceValidationStepResult? = null,
     val showCloudflareDialog: Boolean = false,
     val cloudflareDomain: String = "",
+    val cloudflareSourceId: String = "",
     val cloudflareStepAr: String = "يتم التحقق الآن..."
 )
 
 data class CatalogUiState(
+    val sourceId: String = "",
+    val items: List<MangaSummary> = emptyList(),
     val isLoading: Boolean = false,
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,
@@ -85,6 +99,9 @@ data class CatalogUiState(
     val selectedStatus: StatusFilter = StatusFilter.ALL,
     val currentPage: Int = 1,
     val requiresCloudflareGate: Boolean = false,
+    val verificationState: VerificationState = VerificationState.NOT_REQUIRED,
+    val verificationReasonAr: String? = null,
+    val showEmbeddedWebViewFallback: Boolean = false,
     val errorMessageAr: String? = null
 )
 
@@ -116,16 +133,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val storage = LocalChapterStorage(application)
     val preferences = AppPreferences(application)
 
-    private val registry = SourceRegistry(
+    val verificationSessionManager = VerificationSessionManager()
+    val verificationRepository = VerificationRepository(
+        sessionManager = verificationSessionManager,
+        preferences = preferences
+    )
+    val verificationManager = VerificationManager(
+        detector = VerificationDetector,
+        sessionManager = verificationSessionManager,
+        repository = verificationRepository
+    )
+
+    val registry = SourceRegistry(
         listOf(
             MangalekSource(),
             TeamXSource(),
-            MangatekSource(),
+            MangatekSource(requiresVerificationOverride = true),
             AzoraMangaSource(),
             MangaDexSource()
         )
     )
-    private val validator = SourceValidator(registry)
+    private val validator = SourceValidator(registry, verificationManager)
+    val sourceManager = SourceManager(registry, validator, verificationManager)
     private val downloadEngine = DownloadEngine(application, db, storage, registry)
 
     val repository = MangaRepository(
@@ -133,8 +162,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         registry = registry,
         validator = validator,
         storage = storage,
-        downloadEngine = downloadEngine
+        downloadEngine = downloadEngine,
+        verificationManager = verificationManager,
+        sourceManager = sourceManager
     )
+    val sourceRepository: SourceRepository = repository
+    val verificationSessions: StateFlow<Map<String, VerificationSession>> = repository.verificationSessionsFlow
 
     // ─── NAVIGATION STACK ───
     private val backStack = ArrayDeque<ScreenRoute>()
@@ -221,9 +254,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var readerLoadJob: Job? = null
     private var catalogLoadJob: Job? = null
+    private var catalogObserveJob: Job? = null
     private var detailsLoadJob: Job? = null
 
     init {
+        viewModelScope.launch {
+            repository.ensureDefaultSourcesRegistered()
+        }
         refreshStorageStats()
     }
 
@@ -252,8 +289,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun navigateBack(): Boolean {
         val previous = backStack.removeLastOrNull() ?: return false
         _currentRoute.value = previous
-        if (previous is ScreenRoute.MangaDetailsRoute) {
-            loadMangaDetails(previous.mangaId)
+        when (previous) {
+            is ScreenRoute.MangaDetailsRoute -> loadMangaDetails(previous.mangaId)
+            is ScreenRoute.SourceCatalog -> {
+                if (_catalogState.value.sourceId != previous.sourceId || _catalogState.value.items.isEmpty()) {
+                    loadSourceCatalog(previous.sourceId)
+                }
+            }
+            else -> {}
         }
         return true
     }
@@ -330,10 +373,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val stepResult = res.getOrThrow()
 
             if (stepResult.status == SourceStatus.REQUIRES_VERIFICATION) {
+                val matchedId = stepResult.matchedSource?.id.orEmpty()
+                repository.startSourceVerification(matchedId, stepResult.normalizedDomain)
                 _addSiteDialog.value = _addSiteDialog.value.copy(
                     isChecking = false,
                     showCloudflareDialog = true,
                     cloudflareDomain = stepResult.normalizedDomain,
+                    cloudflareSourceId = matchedId,
                     cloudflareStepAr = "يتم التحقق الآن...",
                     pendingValidationResult = stepResult
                 )
@@ -372,14 +418,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun completeCloudflareHumanVerification() {
+    fun completeCloudflareHumanVerification(
+        verifiedHtml: String? = null,
+        pageTitle: String = ""
+    ) {
         val domain = _addSiteDialog.value.cloudflareDomain
+        val sourceId = _addSiteDialog.value.cloudflareSourceId.ifBlank {
+            (_currentRoute.value as? ScreenRoute.SourceCatalog)?.sourceId.orEmpty()
+        }
         viewModelScope.launch {
             _addSiteDialog.value = _addSiteDialog.value.copy(
                 cloudflareStepAr = "نجح التحقق. في انتظار $domain للاستجابة..."
             )
-            delay(500L)
-            repository.markDomainHumanVerified(domain)
+            delay(350L)
+
+            val session = repository.completeSourceVerification(
+                sourceId = sourceId,
+                domain = domain,
+                verifiedHtml = verifiedHtml,
+                pageTitle = pageTitle
+            )
+
+            if (session.state != VerificationState.COMPLETED) {
+                // Challenge page did not finish yet
+                _addSiteDialog.value = AddSiteDialogState()
+                _catalogState.value = _catalogState.value.copy(
+                    requiresCloudflareGate = true,
+                    verificationState = session.state,
+                    verificationReasonAr = session.reasonAr
+                )
+                return@launch
+            }
+
+            if (!verifiedHtml.isNullOrBlank() && sourceId.isNotBlank()) {
+                repository.ingestVerifiedWebViewHtml(
+                    sourceId = sourceId,
+                    html = verifiedHtml,
+                    baseUrl = "https://$domain"
+                )
+            }
 
             val route = _currentRoute.value
             if (route is ScreenRoute.SourceCatalog) {
@@ -398,13 +475,83 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun cancelCloudflareVerification() {
+        val dialog = _addSiteDialog.value
+        val domain = dialog.cloudflareDomain
+        val sourceId = dialog.cloudflareSourceId.ifBlank {
+            (_currentRoute.value as? ScreenRoute.SourceCatalog)?.sourceId.orEmpty()
+        }
+        if (domain.isNotBlank()) {
+            val cancelledSession = repository.cancelSourceVerification(sourceId, domain)
+            if (_currentRoute.value is ScreenRoute.SourceCatalog) {
+                _catalogState.value = _catalogState.value.copy(
+                    isLoading = false,
+                    requiresCloudflareGate = true,
+                    verificationState = cancelledSession.state,
+                    verificationReasonAr = cancelledSession.reasonAr
+                )
+            }
+        }
+        _addSiteDialog.value = AddSiteDialogState()
+    }
+
+    fun failCloudflareVerification(reasonAr: String) {
+        val dialog = _addSiteDialog.value
+        val domain = dialog.cloudflareDomain
+        val sourceId = dialog.cloudflareSourceId.ifBlank {
+            (_currentRoute.value as? ScreenRoute.SourceCatalog)?.sourceId.orEmpty()
+        }
+        if (domain.isNotBlank()) {
+            val failedSession = repository.failSourceVerification(sourceId, domain, reasonAr)
+            if (_currentRoute.value is ScreenRoute.SourceCatalog) {
+                _catalogState.value = _catalogState.value.copy(
+                    isLoading = false,
+                    requiresCloudflareGate = true,
+                    verificationState = failedSession.state,
+                    verificationReasonAr = failedSession.reasonAr
+                )
+            }
+        }
+        _addSiteDialog.value = AddSiteDialogState()
+    }
+
     fun triggerCatalogCloudflareVerification(domain: String) {
+        val activeSourceId = (_currentRoute.value as? ScreenRoute.SourceCatalog)?.sourceId
+            ?: _catalogState.value.sourceId
+        val session = repository.startSourceVerification(activeSourceId, domain)
+        _catalogState.value = _catalogState.value.copy(
+            verificationState = session.state,
+            verificationReasonAr = session.reasonAr
+        )
         _addSiteDialog.value = AddSiteDialogState(
             isVisible = false,
             showCloudflareDialog = true,
             cloudflareDomain = domain,
+            cloudflareSourceId = activeSourceId,
             cloudflareStepAr = "يتم التحقق الآن..."
         )
+    }
+
+    fun toggleEmbeddedWebViewFallback(enabled: Boolean) {
+        _catalogState.value = _catalogState.value.copy(
+            showEmbeddedWebViewFallback = enabled
+        )
+    }
+
+    fun onVerifiedWebViewHtmlCaptured(sourceId: String, html: String, baseUrl: String) {
+        viewModelScope.launch {
+            val ingested = repository.ingestVerifiedWebViewHtml(sourceId, html, baseUrl)
+            if (ingested.isNotEmpty() && _catalogState.value.sourceId == sourceId) {
+                _catalogState.value = _catalogState.value.copy(
+                    items = ingested,
+                    isLoading = false,
+                    requiresCloudflareGate = false,
+                    showEmbeddedWebViewFallback = false,
+                    verificationState = VerificationState.COMPLETED,
+                    errorMessageAr = null
+                )
+            }
+        }
     }
 
     fun updateManualSiteName(name: String) {
@@ -442,56 +589,160 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun quickAddDemoSourcesIfEmpty() {
         viewModelScope.launch {
-            for (domain in listOf("mangalik.net", "olympustaff.com", "mangatek.com", "azoramanga.com", "mangadex.org")) {
-                repository.markDomainHumanVerified(domain)
-                val v = repository.validateSiteDomain(domain).getOrNull()
-                if (v != null && v.matchedSource != null) {
-                    repository.confirmAndAddSource(v, v.suggestedName)
-                }
-            }
+            repository.ensureDefaultSourcesRegistered()
             showToast("تم تفعيل المصادر المعتمدة بنجاح")
         }
     }
 
     // ─── SOURCE CATALOG & FILTERING ───
     fun loadSourceCatalog(sourceId: String, page: Int = 1) {
+        PipelineLogger.log(
+            stage = PipelineStage.SOURCE_SELECTED,
+            sourceId = sourceId,
+            sourceName = sourceId,
+            status = "SELECTED",
+            details = "page=$page"
+        )
+
+        // Maintain a single stable collector for the active sourceId in Room
+        catalogObserveJob?.cancel()
+        catalogObserveJob = viewModelScope.launch {
+            repository.observeMangaBySource(sourceId).collect { dbItems ->
+                if (_catalogState.value.sourceId == sourceId && dbItems.isNotEmpty() && !_catalogState.value.requiresCloudflareGate) {
+                    _catalogState.value = _catalogState.value.copy(items = dbItems)
+                }
+            }
+        }
+
         catalogLoadJob?.cancel()
         catalogLoadJob = viewModelScope.launch {
+            val initialVerificationState = repository.getSourceVerificationState(sourceId)
+            val initialCached = if (initialVerificationState in listOf(
+                    VerificationState.REQUIRED,
+                    VerificationState.EXPIRED,
+                    VerificationState.FAILED,
+                    VerificationState.CANCELLED
+                )
+            ) {
+                emptyList()
+            } else {
+                repository.getMangaBySourceOnce(sourceId)
+            }
+
             _catalogState.value = _catalogState.value.copy(
+                sourceId = sourceId,
+                items = if (_catalogState.value.sourceId == sourceId && _catalogState.value.items.isNotEmpty() && initialCached.isNotEmpty()) {
+                    _catalogState.value.items
+                } else {
+                    initialCached
+                },
                 isLoading = true,
                 currentPage = page,
                 errorMessageAr = null,
-                requiresCloudflareGate = false
+                requiresCloudflareGate = false,
+                showEmbeddedWebViewFallback = false,
+                verificationState = initialVerificationState
             )
-            val res = withTimeoutOrNull(8_500L) {
+
+            val res = withTimeoutOrNull(22_000L) {
                 repository.refreshSourceCatalog(sourceId, page)
             }
+            val latestVerState = repository.getSourceVerificationState(sourceId)
+            val latestSession = registry.findById(sourceId)?.domain?.let { verificationManager.getSession(it) }
+
             when {
                 res == null -> {
+                    val fallback = repository.getMangaBySourceOnce(sourceId)
                     _catalogState.value = _catalogState.value.copy(
+                        sourceId = sourceId,
+                        items = if (fallback.isNotEmpty()) fallback else _catalogState.value.items,
                         isLoading = false,
-                        errorMessageAr = "استغرق الاتصال وقتاً طويلاً. يرجى المحاولة مجدداً."
+                        verificationState = latestVerState,
+                        errorMessageAr = if (fallback.isEmpty()) {
+                            "استغرق الاتصال وقتاً طويلاً. يرجى التحقق من اتصال الإنترنت والمحاولة مجدداً."
+                        } else null
+                    )
+                    PipelineLogger.log(
+                        stage = PipelineStage.VIEWMODEL_STATE_UPDATED,
+                        sourceId = sourceId,
+                        resultCount = _catalogState.value.items.size,
+                        status = if (_catalogState.value.items.isNotEmpty()) "CACHED_AFTER_TIMEOUT" else "TIMEOUT",
+                        failureReason = "Catalog refresh exceeded 22s timeout"
                     )
                 }
                 res.isFailure -> {
-                    val msg = res.exceptionOrNull()?.message.orEmpty()
-                    if (msg == "SECURITY_VERIFICATION_REQUIRED") {
+                    val ex = res.exceptionOrNull()
+                    val msg = ex?.message.orEmpty()
+                    val fallback = repository.getMangaBySourceOnce(sourceId)
+                    if (ex is VerificationRequiredException || msg == "SECURITY_VERIFICATION_REQUIRED") {
                         _catalogState.value = _catalogState.value.copy(
+                            sourceId = sourceId,
+                            items = emptyList(),
                             isLoading = false,
-                            requiresCloudflareGate = true
+                            requiresCloudflareGate = true,
+                            verificationState = if (latestVerState == VerificationState.NOT_REQUIRED) {
+                                VerificationState.REQUIRED
+                            } else {
+                                latestVerState
+                            },
+                            verificationReasonAr = latestSession?.reasonAr ?: (ex as? VerificationRequiredException)?.detection?.reasonAr
+                        )
+                        PipelineLogger.log(
+                            stage = PipelineStage.VIEWMODEL_STATE_UPDATED,
+                            sourceId = sourceId,
+                            resultCount = 0,
+                            status = "REQUIRES_CLOUDFLARE",
+                            failureReason = msg
+                        )
+                    } else if (msg == "NO_CONTENT_AFTER_VERIFICATION") {
+                        // Verification succeeded (COMPLETED), but native extraction found 0 items -> show WebView fallback
+                        _catalogState.value = _catalogState.value.copy(
+                            sourceId = sourceId,
+                            items = emptyList(),
+                            isLoading = false,
+                            requiresCloudflareGate = false,
+                            showEmbeddedWebViewFallback = true,
+                            verificationState = VerificationState.COMPLETED,
+                            verificationReasonAr = "تم إكمال التحقق الأمني، ويتم عرض الموقع داخل WebView لأن الاستخراج المباشر مقيّد."
                         )
                     } else {
                         _catalogState.value = _catalogState.value.copy(
+                            sourceId = sourceId,
+                            items = if (fallback.isNotEmpty()) fallback else _catalogState.value.items,
                             isLoading = false,
-                            errorMessageAr = msg.ifBlank { "تعذّر تحميل قائمة المانهوا" }
+                            verificationState = latestVerState,
+                            errorMessageAr = if (fallback.isEmpty()) {
+                                msg.ifBlank { "تعذّر تحميل قائمة المانهوا" }
+                            } else null
+                        )
+                        PipelineLogger.log(
+                            stage = PipelineStage.VIEWMODEL_STATE_UPDATED,
+                            sourceId = sourceId,
+                            resultCount = _catalogState.value.items.size,
+                            status = if (_catalogState.value.items.isNotEmpty()) "CACHED_ON_ERROR" else "FAILED",
+                            failureReason = msg
                         )
                     }
                 }
                 else -> {
+                    val fetched = res.getOrNull().orEmpty()
+                    val finalItems = if (fetched.isNotEmpty()) fetched else repository.getMangaBySourceOnce(sourceId)
                     _catalogState.value = _catalogState.value.copy(
+                        sourceId = sourceId,
+                        items = finalItems,
                         isLoading = false,
                         requiresCloudflareGate = false,
+                        showEmbeddedWebViewFallback = false,
+                        verificationState = latestVerState,
+                        verificationReasonAr = latestSession?.reasonAr,
                         errorMessageAr = null
+                    )
+                    PipelineLogger.log(
+                        stage = PipelineStage.VIEWMODEL_STATE_UPDATED,
+                        sourceId = sourceId,
+                        resultCount = finalItems.size,
+                        status = "SUCCESS",
+                        details = "page=$page"
                     )
                 }
             }
@@ -543,7 +794,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isLoading = true,
                 errorMessageAr = null
             )
-            val res = withTimeoutOrNull(8_500L) {
+            val res = withTimeoutOrNull(18_000L) {
                 repository.loadMangaDetailsAndSyncChapters(mangaId)
             }
             val sizeMb = repository.getMangaStorageSizeMb(mangaId)

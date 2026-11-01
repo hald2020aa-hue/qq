@@ -59,6 +59,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -74,9 +75,14 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.core.common.PipelineLogger
+import com.example.core.common.PipelineStage
 import com.example.core.database.FavoriteEntity
 import com.example.core.database.ReadingHistoryEntity
 import com.example.core.images.MangaCoverImage
+import com.example.core.verification.SourceWebViewFallbackView
+import com.example.core.verification.VerificationGateView
+import com.example.core.verification.VerificationState
 import com.example.domain.models.GridDisplayMode
 import com.example.domain.models.MangaSummary
 import com.example.domain.models.SortOption
@@ -336,6 +342,8 @@ fun SourceCatalogScreen(
     onChangeGridMode: (GridDisplayMode) -> Unit,
     onRefreshCatalog: (Int) -> Unit,
     onTriggerCloudflareVerify: (String) -> Unit,
+    onToggleEmbeddedWebViewFallback: (Boolean) -> Unit = {},
+    onVerifiedWebViewHtmlCaptured: (String, String, String) -> Unit = { _, _, _ -> },
     onNavigateDownloads: () -> Unit,
     onNavigateSettings: () -> Unit
 ) {
@@ -384,6 +392,20 @@ fun SourceCatalogScreen(
             SortOption.RATING -> list.sortedByDescending { it.rating ?: 0f }
             SortOption.MOST_VIEWED, SortOption.POPULAR -> list.sortedByDescending { it.rating ?: 0f }
             else -> list
+        }
+    }
+
+    LaunchedEffect(source?.id, filteredItems.size, catalogState.isLoading) {
+        if (!catalogState.isLoading) {
+            val activeSourceId = source?.id ?: catalogState.sourceId.ifBlank { "unknown" }
+            PipelineLogger.log(
+                stage = PipelineStage.UI_RENDERED_RESULTS,
+                sourceId = activeSourceId,
+                sourceName = source?.name ?: activeSourceId,
+                resultCount = filteredItems.size,
+                status = if (filteredItems.isNotEmpty()) "RENDERED_SUCCESS" else "RENDERED_EMPTY",
+                failureReason = catalogState.errorMessageAr
+            )
         }
     }
 
@@ -517,11 +539,27 @@ fun SourceCatalogScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "صفحة ${catalogState.currentPage} • (${filteredItems.size} عمل)",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "صفحة ${catalogState.currentPage} • (${filteredItems.size} عمل)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (catalogState.verificationState == VerificationState.COMPLETED) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFF4CAF50).copy(alpha = 0.16f)
+                    ) {
+                        Text(
+                            text = "جلسة موثقة",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFF4CAF50),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
@@ -579,50 +617,35 @@ fun SourceCatalogScreen(
             }
         }
 
-        // Explicit 4-state UI handling:
-        // 1) Cloudflare Gate
-        // 2) Loading (only when no cached items yet)
-        // 3) Error (when no cached items + retry button)
-        // 4) Empty state (when filter/search returns 0 items)
-        // 5) Success Grid/List
+        // Explicit 6-state UI handling:
+        // 1) Universal Website Verification Gate (REQUIRED / EXPIRED / FAILED / CANCELLED)
+        // 2) Embedded WebView Fallback (when verification COMPLETED but native extraction is restricted)
+        // 3) Loading (only when no cached items yet)
+        // 4) Error (when no cached items + retry button)
+        // 5) Empty state (when filter/search returns 0 items)
+        // 6) Success Grid/List
         when {
             catalogState.requiresCloudflareGate && source != null -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            imageVector = Icons.Default.SmartToy,
-                            contentDescription = "التحقق الأمني",
-                            tint = Color(0xFFB0B8C8),
-                            modifier = Modifier.size(56.dp)
-                        )
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Text(
-                            text = "عليك فتح الصفحة وإكمال التحقق",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onBackground
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Button(
-                            onClick = { onTriggerCloudflareVerify(source.domain) },
-                            shape = RoundedCornerShape(24.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.primary
-                            ),
-                            modifier = Modifier.testTag("open_site_verification_button")
-                        ) {
-                            Text(
-                                text = "فتح صفحة الموقع",
-                                color = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
-                            )
-                        }
+                VerificationGateView(
+                    source = source,
+                    verificationState = catalogState.verificationState,
+                    statusReasonAr = catalogState.verificationReasonAr,
+                    onOpenVerificationPage = { onTriggerCloudflareVerify(source.domain) },
+                    onRetryLoad = { onRefreshCatalog(catalogState.currentPage) },
+                    onOpenEmbeddedWebViewFallback = { onToggleEmbeddedWebViewFallback(true) }
+                )
+            }
+            catalogState.showEmbeddedWebViewFallback && source != null -> {
+                SourceWebViewFallbackView(
+                    source = source,
+                    onRetryNativeExtraction = {
+                        onToggleEmbeddedWebViewFallback(false)
+                        onRefreshCatalog(catalogState.currentPage)
+                    },
+                    onMangaHtmlCaptured = { html, baseUrl ->
+                        onVerifiedWebViewHtmlCaptured(source.id, html, baseUrl)
                     }
-                }
+                )
             }
             catalogState.isLoading && filteredItems.isEmpty() -> {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

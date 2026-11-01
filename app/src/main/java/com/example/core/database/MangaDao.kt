@@ -37,6 +37,9 @@ interface MangaDao {
     @Query("SELECT * FROM manga WHERE sourceId = :sourceId ORDER BY updatedAt DESC")
     fun observeMangaBySource(sourceId: String): Flow<List<MangaEntity>>
 
+    @Query("SELECT * FROM manga WHERE sourceId = :sourceId ORDER BY updatedAt DESC")
+    suspend fun getMangaBySourceOnce(sourceId: String): List<MangaEntity>
+
     @Query("SELECT * FROM manga WHERE isSavedInStorage = 1 OR id IN (SELECT DISTINCT mangaId FROM chapters WHERE isDownloaded = 1) ORDER BY updatedAt DESC")
     fun observeStoredManga(): Flow<List<MangaEntity>>
 

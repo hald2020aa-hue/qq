@@ -31,6 +31,7 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -176,12 +177,19 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
 
                     is ScreenRoute.SourceCatalog -> {
                         val sourceInfo = addedSources.firstOrNull { it.id == route.sourceId }
-                        val sourceMangaFlow = vm.repository.observeMangaBySource(route.sourceId)
-                        val sourceManga by sourceMangaFlow.collectAsState(initial = emptyList())
+                        val sourceMangaFlow = remember(route.sourceId) {
+                            vm.repository.observeMangaBySource(route.sourceId)
+                        }
+                        val dbManga by sourceMangaFlow.collectAsState(initial = emptyList())
+                        val effectiveMangaItems = if (catalogState.sourceId == route.sourceId && catalogState.items.isNotEmpty()) {
+                            catalogState.items
+                        } else {
+                            dbManga
+                        }
 
                         SourceCatalogScreen(
                             source = sourceInfo,
-                            mangaItems = sourceManga,
+                            mangaItems = effectiveMangaItems,
                             catalogState = catalogState,
                             gridDisplayMode = settings.gridDisplayMode,
                             onOpenDrawer = { scope.launch { drawerState.open() } },
@@ -195,6 +203,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             onChangeGridMode = vm::setGridDisplayMode,
                             onRefreshCatalog = { page -> vm.loadSourceCatalog(route.sourceId, page) },
                             onTriggerCloudflareVerify = vm::triggerCatalogCloudflareVerification,
+                            onToggleEmbeddedWebViewFallback = vm::toggleEmbeddedWebViewFallback,
+                            onVerifiedWebViewHtmlCaptured = vm::onVerifiedWebViewHtmlCaptured,
                             onNavigateDownloads = { vm.navigateTo(ScreenRoute.Downloads) },
                             onNavigateSettings = { vm.navigateTo(ScreenRoute.SettingsMain) }
                         )
@@ -281,15 +291,24 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                     }
 
                     is ScreenRoute.MangaDetailsRoute -> {
-                        val chapters by vm.repository.observeChaptersForManga(route.mangaId).collectAsState(initial = emptyList())
-                        val isFav by vm.repository.observeIsFavorite(route.mangaId).collectAsState(initial = false)
-                        val lastHist by vm.repository.observeHistoryForManga(route.mangaId).collectAsState(initial = null)
+                        val chaptersFlow = remember(route.mangaId) { vm.repository.observeChaptersForManga(route.mangaId) }
+                        val isFavFlow = remember(route.mangaId) { vm.repository.observeIsFavorite(route.mangaId) }
+                        val lastHistFlow = remember(route.mangaId) { vm.repository.observeHistoryForManga(route.mangaId) }
+
+                        val chapters by chaptersFlow.collectAsState(initial = emptyList())
+                        val isFav by isFavFlow.collectAsState(initial = false)
+                        val lastHist by lastHistFlow.collectAsState(initial = null)
+                        val effectiveChapters = if (chapters.isNotEmpty()) {
+                            chapters
+                        } else {
+                            detailsState.details?.chapters.orEmpty()
+                        }
                         val sourceInfo = addedSources.firstOrNull { it.id == detailsState.details?.sourceId }
 
                         MangaDetailsScreen(
                             mangaId = route.mangaId,
                             state = detailsState,
-                            chapters = chapters,
+                            chapters = effectiveChapters,
                             isFavorite = isFav,
                             lastHistory = lastHist,
                             sourceInfo = sourceInfo,
@@ -314,9 +333,13 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                     }
 
                     is ScreenRoute.ReaderRoute -> {
-                        val chapters by vm.repository.observeChaptersForManga(route.mangaId).collectAsState(initial = emptyList())
-                        val mangaEntity by vm.repository.observeMangaEntity(route.mangaId).collectAsState(initial = null)
-                        val isFav by vm.repository.observeIsFavorite(route.mangaId).collectAsState(initial = false)
+                        val chaptersFlow = remember(route.mangaId) { vm.repository.observeChaptersForManga(route.mangaId) }
+                        val mangaEntityFlow = remember(route.mangaId) { vm.repository.observeMangaEntity(route.mangaId) }
+                        val isFavFlow = remember(route.mangaId) { vm.repository.observeIsFavorite(route.mangaId) }
+
+                        val chapters by chaptersFlow.collectAsState(initial = emptyList())
+                        val mangaEntity by mangaEntityFlow.collectAsState(initial = null)
+                        val isFav by isFavFlow.collectAsState(initial = false)
 
                         MangaReaderScreen(
                             mangaId = route.mangaId,
@@ -454,7 +477,9 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
         onDismiss = vm::closeAddSiteDialog,
         onManualNameChanged = vm::updateManualSiteName,
         onConfirmManualAdd = vm::confirmManualSiteAddition,
-        onCompleteCloudflareVerify = vm::completeCloudflareHumanVerification
+        onCompleteCloudflareVerify = vm::completeCloudflareHumanVerification,
+        onFailCloudflareVerify = vm::failCloudflareVerification,
+        onCancelCloudflareVerify = vm::cancelCloudflareVerification
     )
 
     if (showLoginPrompt) {

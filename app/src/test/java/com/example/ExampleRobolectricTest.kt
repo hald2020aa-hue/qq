@@ -8,7 +8,24 @@ import com.example.core.database.MangaDatabase
 import com.example.core.database.MangaEntity
 import com.example.core.database.ReadingHistoryEntity
 import com.example.core.database.SourceEntity
+import com.example.core.verification.VerificationChallengeType
+import com.example.core.verification.VerificationDetectionResult
+import com.example.core.verification.VerificationManager
+import com.example.core.verification.VerificationRepository
+import com.example.core.verification.VerificationRequiredException
+import com.example.core.verification.VerificationSessionManager
+import com.example.core.verification.VerificationState
+import com.example.domain.models.MangaChapter
+import com.example.domain.models.MangaDetails
+import com.example.domain.models.MangaPage
+import com.example.domain.models.MangaSummary
+import com.example.domain.models.PageResult
+import com.example.sourceapi.MangaSource
+import com.example.sourceapi.SourceManager
+import com.example.sourceapi.SourceRegistry
+import com.example.sourceapi.SourceValidator
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -124,5 +141,180 @@ class ExampleRobolectricTest {
         val history = dao.observeHistoryForManga("mangalek_murim").first()
         assertEquals(14, history?.pageIndex)
         assertEquals(320, history?.scrollOffset)
+    }
+
+    @Test
+    fun `mangaRepository refreshSourceCatalog persists live items to Room and logs pipeline stages`() = runBlocking {
+        val registry = SourceRegistry(
+            listOf(
+                com.example.sources.MangalekSource(),
+                com.example.sources.TeamXSource(),
+                com.example.sources.MangatekSource(),
+                com.example.sources.AzoraMangaSource(),
+                com.example.sources.MangaDexSource()
+            )
+        )
+        val validator = SourceValidator(registry)
+        val storage = com.example.core.storage.LocalChapterStorage(context)
+        val downloadEngine = com.example.core.downloads.DownloadEngine(context, db, storage, registry)
+        val repository = com.example.data.repositories.MangaRepository(
+            dao = db.mangaDao(),
+            registry = registry,
+            validator = validator,
+            storage = storage,
+            downloadEngine = downloadEngine
+        )
+
+        com.example.core.common.PipelineLogger.clear()
+        repository.ensureDefaultSourcesRegistered()
+
+        val registeredSourcesInDb = db.mangaDao().getAllSourcesOnce()
+        assertEquals(5, registeredSourcesInDb.size)
+
+        val refreshResult = repository.refreshSourceCatalog("mangalek", 1)
+        assertTrue("refreshSourceCatalog must succeed", refreshResult.isSuccess)
+        val items = refreshResult.getOrThrow()
+        assertTrue("Returned items must not be empty", items.isNotEmpty())
+
+        val storedInRoom = repository.getMangaBySourceOnce("mangalek")
+        assertTrue("Room database must contain synced manga for mangalek", storedInRoom.isNotEmpty())
+
+        val stageLogs = com.example.core.common.PipelineLogger.getLogsForSource("mangalek")
+        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.SOURCE_FOUND_IN_REGISTRY })
+        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.GET_POPULAR_CALLED })
+        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.MANGA_RESULTS_RECEIVED })
+        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.REPOSITORY_UPDATED })
+    }
+
+    @Test
+    fun `scenario9 and endToEnd repository verification flow separates verification success from extraction result`() = runBlocking {
+        val sessionManager = VerificationSessionManager()
+        val verificationRepository = VerificationRepository(sessionManager)
+        val verificationManager = VerificationManager(
+            sessionManager = sessionManager,
+            repository = verificationRepository
+        )
+
+        // Source that requires verification, and returns 0 items when no HTML snapshot is provided
+        val emptyAfterVerifySource = object : MangaSource {
+            override val id: String = "protected_empty_source"
+            override val name: String = "موقع محمي بدون أعمال مستخرجة"
+            override val baseUrl: String = "https://protected-empty.example.com"
+            override val domain: String = "protected-empty.example.com"
+            override val iconText: String = "PE"
+            override val iconColorHex: Long = 0xFF607D8B
+            override val requiresCloudflareVerification: Boolean = true
+
+            override suspend fun getPopular(page: Int): PageResult<MangaSummary> {
+                if (!verificationManager.isVerified(domain)) {
+                    throw VerificationRequiredException(
+                        sourceId = id,
+                        domain = domain,
+                        targetUrl = baseUrl,
+                        detection = VerificationDetectionResult(
+                            isVerificationRequired = true,
+                            challengeType = VerificationChallengeType.CLOUDFLARE_CHALLENGE,
+                            httpCode = 403,
+                            reasonAr = "يتطلب هذا الموقع إكمال التحقق الأمني."
+                        )
+                    )
+                }
+                return PageResult(items = emptyList(), page = page, hasNextPage = false)
+            }
+
+            override suspend fun search(query: String, page: Int): PageResult<MangaSummary> = getPopular(page)
+            override suspend fun getDetails(mangaUrl: String): MangaDetails = throw UnsupportedOperationException()
+            override suspend fun getChapters(mangaUrl: String): List<MangaChapter> = emptyList()
+            override suspend fun getPages(chapterUrl: String): List<MangaPage> = emptyList()
+        }
+
+        val mangatekProtected = com.example.sources.MangatekSource(requiresVerificationOverride = true)
+        val registry = SourceRegistry(listOf(mangatekProtected, emptyAfterVerifySource))
+        val validator = SourceValidator(registry, verificationManager)
+        val sourceManager = SourceManager(registry, validator, verificationManager)
+        val storage = com.example.core.storage.LocalChapterStorage(context)
+        val downloadEngine = com.example.core.downloads.DownloadEngine(context, db, storage, registry)
+        val repository = com.example.data.repositories.MangaRepository(
+            dao = db.mangaDao(),
+            registry = registry,
+            validator = validator,
+            storage = storage,
+            downloadEngine = downloadEngine,
+            verificationManager = verificationManager,
+            sourceManager = sourceManager
+        )
+
+        repository.ensureDefaultSourcesRegistered()
+
+        // 1. Before verification: Mangatek returns failure with VerificationRequiredException
+        val beforeVerifyResult = repository.refreshSourceCatalog("mangatek", 1)
+        assertTrue(beforeVerifyResult.isFailure)
+        assertTrue(beforeVerifyResult.exceptionOrNull() is VerificationRequiredException)
+        assertEquals(
+            VerificationState.REQUIRED,
+            repository.getSourceVerificationState("mangatek")
+        )
+
+        // 2. Complete verification for Mangatek -> extraction succeeds and persists to Room
+        val verifiedMangatekHtml = """
+            <!DOCTYPE html>
+            <html>
+            <head><title>مانجاتك - Mangatek</title></head>
+            <body>
+                <div class="page-item-detail">
+                    <div class="item-thumb">
+                        <a href="https://mangatek.com/manga/reaper-of-the-drifting-moon/">
+                            <img src="https://mangatek.com/covers/reaper.webp" />
+                        </a>
+                    </div>
+                    <div class="post-title">
+                        <h3><a href="https://mangatek.com/manga/reaper-of-the-drifting-moon/">Reaper of the Drifting Moon</a></h3>
+                    </div>
+                    <div class="chapter-item"><span class="chapter">الفصل 95</span></div>
+                </div>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val completedSession = verificationManager.completeVerification("mangatek", "mangatek.com", verifiedMangatekHtml)
+        assertEquals(VerificationState.COMPLETED, completedSession.state)
+        assertEquals(VerificationState.COMPLETED, repository.getSourceVerificationState("mangatek"))
+
+        val afterVerifyResult = repository.refreshSourceCatalog("mangatek", 1)
+        assertTrue("Mangatek refresh must succeed after verification", afterVerifyResult.isSuccess)
+        assertEquals(1, afterVerifyResult.getOrThrow().size)
+        assertEquals("Reaper of the Drifting Moon", afterVerifyResult.getOrThrow().first().title)
+
+        // 3. Scenario 9: Separate verification success (COMPLETED) from manga extraction (0 items after verification)
+        val validEmptySiteHtml = """
+            <!DOCTYPE html>
+            <html>
+            <head><title>موقع محمي - الرئيسية</title></head>
+            <body><div class="site-container"><p>تم التحقق بنجاح ولكن المحتوى محمل بـ Canvas مخصص</p></div></body>
+            </html>
+        """.trimIndent()
+        val emptySiteSession = verificationManager.completeVerification(
+            "protected_empty_source",
+            "protected-empty.example.com",
+            validEmptySiteHtml
+        )
+        assertEquals("Verification itself must succeed", VerificationState.COMPLETED, emptySiteSession.state)
+        assertEquals(
+            VerificationState.COMPLETED,
+            repository.getSourceVerificationState("protected_empty_source")
+        )
+
+        val emptyExtractionResult = repository.refreshSourceCatalog("protected_empty_source", 1)
+        assertTrue("Extraction with 0 items must fail with NO_CONTENT_AFTER_VERIFICATION", emptyExtractionResult.isFailure)
+        assertEquals(
+            "NO_CONTENT_AFTER_VERIFICATION",
+            emptyExtractionResult.exceptionOrNull()?.message
+        )
+        // Crucially, verification state remains COMPLETED (not reset to REQUIRED)
+        assertEquals(
+            VerificationState.COMPLETED,
+            repository.getSourceVerificationState("protected_empty_source")
+        )
+        assertTrue(verificationManager.isVerified("protected-empty.example.com"))
     }
 }

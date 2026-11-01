@@ -1,6 +1,11 @@
 package com.example.sourceapi
 
 import com.example.core.common.normalizeDomain
+import com.example.core.verification.VerificationChallengeType
+import com.example.core.verification.VerificationDetectionResult
+import com.example.core.verification.VerificationDetector
+import com.example.core.verification.VerificationManager
+import com.example.core.verification.VerificationState
 import com.example.domain.models.MangaChapter
 import com.example.domain.models.MangaDetails
 import com.example.domain.models.MangaPage
@@ -15,7 +20,8 @@ import java.net.URI
 
 /**
  * Section 7 & Rule 2: Unified extension connector interface.
- * Every source implements this independently without coupling UI to HTML structure.
+ * Every source implements this independently without coupling UI to HTML structure,
+ * and can report its need for security verification via [VerificationDetector] / [VerificationManager].
  */
 interface MangaSource {
     val id: String
@@ -26,6 +32,24 @@ interface MangaSource {
     val iconColorHex: Long
     val requiresCloudflareVerification: Boolean
         get() = false
+
+    fun attachVerificationManager(manager: VerificationManager) {}
+
+    fun detectSecurityChallenge(
+        html: String,
+        httpCode: Int = 200,
+        headers: Map<String, String> = emptyMap(),
+        pageTitle: String = ""
+    ): VerificationDetectionResult {
+        return VerificationDetector.detect(
+            html = html,
+            httpCode = httpCode,
+            headers = headers,
+            pageTitle = pageTitle
+        )
+    }
+
+    fun parseVerifiedHtmlSnapshot(html: String, pageBaseUri: String = baseUrl): List<MangaSummary> = emptyList()
 
     suspend fun getPopular(page: Int): PageResult<MangaSummary>
     suspend fun search(query: String, page: Int): PageResult<MangaSummary>
@@ -141,14 +165,7 @@ object HtmlImageExtractor {
     }
 
     fun isSecurityVerificationPage(html: String, httpCode: Int = 200): Boolean {
-        val lower = html.lowercase()
-        return httpCode in listOf(403, 503, 429) && (
-            lower.contains("cloudflare") ||
-                lower.contains("cf-browser-verification") ||
-                lower.contains("turnstile") ||
-                lower.contains("just a moment") ||
-                lower.contains("إجراء التحقق من الأمان")
-            )
+        return VerificationDetector.detect(html = html, httpCode = httpCode).isVerificationRequired
     }
 
     /**
@@ -222,24 +239,40 @@ class SourceRegistry(sources: List<MangaSource>) {
     fun getAllRegistered(): List<MangaSource> = byId.values.toList()
 }
 
-class SourceValidator(private val registry: SourceRegistry) {
-    private val verifiedDomains = mutableSetOf<String>()
-
-    fun markDomainHumanVerified(domain: String) {
-        runCatching { normalizeDomain(domain) }.getOrNull()?.let {
-            verifiedDomains.add(it)
+class SourceValidator(
+    private val registry: SourceRegistry,
+    val verificationManager: VerificationManager = VerificationManager()
+) {
+    init {
+        registry.getAllRegistered().forEach { source ->
+            source.attachVerificationManager(verificationManager)
         }
+    }
+
+    fun markDomainHumanVerified(domain: String, verifiedHtml: String? = null) {
+        val clean = runCatching { normalizeDomain(domain) }.getOrNull() ?: return
+        val matched = registry.findByDomain(clean)
+        verificationManager.completeVerification(
+            sourceId = matched?.id ?: clean,
+            domain = clean,
+            verifiedHtml = verifiedHtml
+        )
     }
 
     fun isDomainHumanVerified(domain: String): Boolean {
         val clean = runCatching { normalizeDomain(domain) }.getOrNull() ?: return false
-        return verifiedDomains.contains(clean)
+        return verificationManager.isVerified(clean)
+    }
+
+    fun getVerificationState(domain: String): VerificationState {
+        val clean = runCatching { normalizeDomain(domain) }.getOrDefault(domain)
+        return verificationManager.getState(clean)
     }
 
     /**
      * Rule 3 & Rule 20: Adding a domain alone does NOT make a site supported.
      * Validates the domain syntax, checks if a registered connector exists,
-     * checks if human verification (Cloudflare) is required, and tests getPopular + getDetails + getChapters.
+     * checks if human verification (Cloudflare/Human Check) is required, and tests getPopular + getDetails + getChapters.
      */
     suspend fun validateDomainCompatibility(rawInput: String): Result<SourceValidationStepResult> {
         val normalized = try {
@@ -260,13 +293,19 @@ class SourceValidator(private val registry: SourceRegistry) {
             )
 
         if (connector.requiresCloudflareVerification && !isDomainHumanVerified(normalized)) {
+            verificationManager.markVerificationRequired(
+                sourceId = connector.id,
+                domain = normalized,
+                challengeType = VerificationChallengeType.CLOUDFLARE_CHALLENGE,
+                reasonAr = "يتطلب هذا الموقع إكمال التحقق الأمني"
+            )
             return Result.success(
                 SourceValidationStepResult(
                     normalizedDomain = normalized,
                     status = SourceStatus.REQUIRES_VERIFICATION,
                     matchedSource = connector,
                     suggestedName = connector.name,
-                    messageAr = "يتطلب الموقع إتمام التحقق الأمني (Cloudflare) للمتابعة."
+                    messageAr = "يتطلب هذا الموقع إكمال التحقق الأمني."
                 )
             )
         }
@@ -309,6 +348,22 @@ class SourceValidator(private val registry: SourceRegistry) {
                 }
             }
         } catch (e: Exception) {
+            if (e.message == "SECURITY_VERIFICATION_REQUIRED") {
+                verificationManager.markVerificationRequired(
+                    sourceId = connector.id,
+                    domain = normalized,
+                    reasonAr = "يتطلب هذا الموقع إكمال التحقق الأمني"
+                )
+                return Result.success(
+                    SourceValidationStepResult(
+                        normalizedDomain = normalized,
+                        status = SourceStatus.REQUIRES_VERIFICATION,
+                        matchedSource = connector,
+                        suggestedName = connector.name,
+                        messageAr = "يتطلب هذا الموقع إكمال التحقق الأمني."
+                    )
+                )
+            }
             Result.success(
                 SourceValidationStepResult(
                     normalizedDomain = normalized,
@@ -319,5 +374,36 @@ class SourceValidator(private val registry: SourceRegistry) {
                 )
             )
         }
+    }
+}
+
+/**
+ * Section 6: SourceManager coordinating [SourceRegistry], [SourceValidator], and [VerificationManager].
+ */
+class SourceManager(
+    val registry: SourceRegistry,
+    val validator: SourceValidator,
+    val verificationManager: VerificationManager = validator.verificationManager
+) {
+    init {
+        registry.getAllRegistered().forEach { source ->
+            source.attachVerificationManager(verificationManager)
+        }
+    }
+
+    fun getSourceById(sourceId: String): MangaSource? = registry.findById(sourceId)
+
+    fun getSourceByDomain(domain: String): MangaSource? = registry.findByDomain(domain)
+
+    fun getAllSources(): List<MangaSource> = registry.getAllRegistered()
+
+    fun getVerificationStateForSource(sourceIdOrDomain: String): VerificationState {
+        val source = registry.findById(sourceIdOrDomain) ?: registry.findByDomain(sourceIdOrDomain)
+        val key = source?.domain ?: sourceIdOrDomain
+        val currentState = verificationManager.getState(key)
+        if (currentState == VerificationState.NOT_REQUIRED && source?.requiresCloudflareVerification == true) {
+            return VerificationState.REQUIRED
+        }
+        return currentState
     }
 }

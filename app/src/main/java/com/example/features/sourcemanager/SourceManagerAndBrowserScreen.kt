@@ -78,6 +78,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import com.example.R
 import com.example.core.common.isInternalOrLocalAddress
+import com.example.core.verification.VerificationWebView
 import com.example.domain.models.SourceInfo
 import com.example.features.AddSiteDialogState
 import com.example.features.navigation.SourceBadgeIcon
@@ -353,7 +354,9 @@ fun AddSiteAndVerificationDialogs(
     onDismiss: () -> Unit,
     onManualNameChanged: (String) -> Unit,
     onConfirmManualAdd: () -> Unit,
-    onCompleteCloudflareVerify: () -> Unit
+    onCompleteCloudflareVerify: (String?, String) -> Unit,
+    onFailCloudflareVerify: (String) -> Unit = {},
+    onCancelCloudflareVerify: () -> Unit = onDismiss
 ) {
     val clipboard = LocalClipboardManager.current
 
@@ -558,96 +561,20 @@ fun AddSiteAndVerificationDialogs(
         }
     }
 
-    // 3. Cloudflare Security Verification Dialog (Video 3 00:10-00:18 & Video 4 00:08-00:14)
+    // 3. Universal Website Verification WebView Dialog (Section 3 & Video 00:06 - 00:14)
     if (state.showCloudflareDialog) {
-        var checkedHuman by remember { mutableStateOf(false) }
-        Dialog(onDismissRequest = onDismiss) {
-            Surface(
-                shape = RoundedCornerShape(20.dp),
-                color = Color(0xFF111318),
-                tonalElevation = 10.dp,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(22.dp),
-                    horizontalAlignment = Alignment.Start
-                ) {
-                    Text(
-                        text = state.cloudflareDomain,
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = Color.White
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "إجراء التحقق من الأمان",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Color(0xFFD0D5E0)
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "يستخدم هذا الموقع خدمة أمنية للحماية من برامج الروبوتات الضارة. يتم عرض هذه الصفحة بينما يتحقق موقع الويب من أنك لست روبوتاً.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF9AA0B0)
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Interactive Cloudflare Turnstile Box
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF1C1F26))
-                            .border(1.dp, Color(0xFF3A4050), RoundedCornerShape(8.dp))
-                            .clickable {
-                                checkedHuman = true
-                                onCompleteCloudflareVerify()
-                            }
-                            .padding(14.dp)
-                            .testTag("cloudflare_verify_checkbox"),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column {
-                            Text(
-                                text = "CLOUDFLARE",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color(0xFFF6821F),
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = "الخصوصية • المساعدة",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color(0xFF7A8294)
-                            )
-                        }
-
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = if (checkedHuman) state.cloudflareStepAr else "تحقق من أنك إنسان",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Color.White
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Icon(
-                                imageVector = if (checkedHuman) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
-                                contentDescription = "تحقق",
-                                tint = if (checkedHuman) Color(0xFF66BB6A) else Color.White,
-                                modifier = Modifier.size(26.dp)
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(18.dp))
-                    HorizontalDivider(color = Color(0xFF2A2E39))
-                    Spacer(modifier = Modifier.height(8.dp))
-                    TextButton(onClick = onDismiss) {
-                        Text("Cancel", color = Color.White)
-                    }
-                }
-            }
-        }
+        VerificationWebView(
+            domain = state.cloudflareDomain,
+            sourceName = state.pendingValidationResult?.suggestedName ?: state.cloudflareDomain,
+            stepMessageAr = state.cloudflareStepAr,
+            onVerificationCompleted = { verifiedHtml, pageTitle ->
+                onCompleteCloudflareVerify(verifiedHtml, pageTitle)
+            },
+            onVerificationFailed = { reasonAr ->
+                onFailCloudflareVerify(reasonAr)
+            },
+            onCancel = onCancelCloudflareVerify
+        )
     }
 }
 

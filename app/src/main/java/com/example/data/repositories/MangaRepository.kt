@@ -1,5 +1,7 @@
 package com.example.data.repositories
 
+import com.example.core.common.PipelineLogger
+import com.example.core.common.PipelineStage
 import com.example.core.database.ChapterEntity
 import com.example.core.database.FavoriteEntity
 import com.example.core.database.MangaDao
@@ -10,6 +12,12 @@ import com.example.core.database.SourceEntity
 import com.example.core.downloads.DownloadEngine
 import com.example.core.storage.LocalChapterStorage
 import com.example.core.storage.StorageStats
+import com.example.core.verification.VerificationChallengeType
+import com.example.core.verification.VerificationDetectionResult
+import com.example.core.verification.VerificationManager
+import com.example.core.verification.VerificationRequiredException
+import com.example.core.verification.VerificationSession
+import com.example.core.verification.VerificationState
 import com.example.domain.models.DownloadStatus
 import com.example.domain.models.DownloadTask
 import com.example.domain.models.MangaChapter
@@ -18,33 +26,160 @@ import com.example.domain.models.MangaPage
 import com.example.domain.models.MangaSummary
 import com.example.domain.models.SourceInfo
 import com.example.domain.models.SourceStatus
+import com.example.sourceapi.MangaSource
+import com.example.sourceapi.SourceManager
 import com.example.sourceapi.SourceRegistry
 import com.example.sourceapi.SourceValidationStepResult
 import com.example.sourceapi.SourceValidator
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import java.io.File
+
+/**
+ * Section 6: SourceRepository contract managing source registration, domain validation,
+ * and security verification states across [SourceManager], [SourceRegistry], and [VerificationManager].
+ */
+interface SourceRepository {
+    val addedSourcesFlow: Flow<List<SourceInfo>>
+    val verificationSessionsFlow: StateFlow<Map<String, VerificationSession>>
+    suspend fun ensureDefaultSourcesRegistered()
+    suspend fun resolveConnector(sourceIdOrDomain: String): MangaSource?
+    suspend fun validateSiteDomain(rawInput: String): Result<SourceValidationStepResult>
+    fun getSourceVerificationState(sourceIdOrDomain: String): VerificationState
+    fun startSourceVerification(sourceId: String, domain: String): VerificationSession
+    fun completeSourceVerification(sourceId: String, domain: String, verifiedHtml: String? = null, pageTitle: String = ""): VerificationSession
+    fun cancelSourceVerification(sourceId: String, domain: String): VerificationSession
+    fun failSourceVerification(sourceId: String, domain: String, reasonAr: String): VerificationSession
+}
 
 class MangaRepository(
     private val dao: MangaDao,
     private val registry: SourceRegistry,
     private val validator: SourceValidator,
     private val storage: LocalChapterStorage,
-    private val downloadEngine: DownloadEngine
-) {
+    private val downloadEngine: DownloadEngine,
+    val verificationManager: VerificationManager = validator.verificationManager,
+    val sourceManager: SourceManager = SourceManager(registry, validator, verificationManager)
+) : SourceRepository {
+
+    override val verificationSessionsFlow: StateFlow<Map<String, VerificationSession>> =
+        verificationManager.sessionsFlow
 
     // ─── SOURCES MANAGEMENT ───
-    val addedSourcesFlow: Flow<List<SourceInfo>> = dao.observeSources().map { list ->
+    override val addedSourcesFlow: Flow<List<SourceInfo>> = dao.observeSources().map { list ->
         list.map { it.toDomain() }
     }
 
-    suspend fun validateSiteDomain(rawInput: String): Result<SourceValidationStepResult> {
+    /**
+     * Ensures all registered connectors in [SourceRegistry] are present in the Room `sources` table
+     * on initial launch so the user never sees an empty sources drawer or unlinked source IDs.
+     * Sources that require human verification (`requiresCloudflareVerification == true`) are
+     * initialized to [VerificationState.REQUIRED] unless a valid persisted session already exists.
+     */
+    override suspend fun ensureDefaultSourcesRegistered() {
+        val existingSources = dao.getAllSourcesOnce()
+        val existingIds = existingSources.map { it.id }.toSet()
+        val existingDomains = existingSources.map { it.domain.lowercase() }.toSet()
+
+        for (connector in registry.getAllRegistered()) {
+            connector.attachVerificationManager(verificationManager)
+            if (connector.requiresCloudflareVerification) {
+                val currentState = verificationManager.getState(connector.domain)
+                if (currentState == VerificationState.NOT_REQUIRED && !verificationManager.isVerified(connector.domain)) {
+                    verificationManager.markVerificationRequired(
+                        sourceId = connector.id,
+                        domain = connector.domain,
+                        challengeType = VerificationChallengeType.CLOUDFLARE_CHALLENGE,
+                        reasonAr = "يتطلب هذا الموقع إكمال التحقق الأمني"
+                    )
+                }
+            } else {
+                if (verificationManager.getSession(connector.domain) == null) {
+                    verificationManager.repository.saveSession(
+                        sourceId = connector.id,
+                        domain = connector.domain,
+                        state = VerificationState.NOT_REQUIRED,
+                        challengeType = VerificationChallengeType.NONE,
+                        reasonAr = VerificationState.NOT_REQUIRED.labelAr
+                    )
+                }
+            }
+
+            if (connector.id !in existingIds && connector.domain.lowercase() !in existingDomains) {
+                val initialStatus = if (connector.requiresCloudflareVerification && !verificationManager.isVerified(connector.domain)) {
+                    SourceStatus.REQUIRES_VERIFICATION.name
+                } else {
+                    SourceStatus.SUPPORTED.name
+                }
+                val entity = SourceEntity(
+                    id = connector.id,
+                    name = connector.name,
+                    domain = connector.domain,
+                    baseUrl = connector.baseUrl,
+                    language = "ar",
+                    iconUrl = null,
+                    iconText = connector.iconText,
+                    iconColorHex = connector.iconColorHex,
+                    isEnabled = true,
+                    isSupported = true,
+                    status = initialStatus,
+                    version = 1,
+                    lastCheckedAt = System.currentTimeMillis()
+                )
+                dao.upsertSource(entity)
+            }
+        }
+    }
+
+    override suspend fun resolveConnector(sourceIdOrDomain: String): MangaSource? {
+        registry.findById(sourceIdOrDomain)?.let { return it }
+        registry.findByDomain(sourceIdOrDomain)?.let { return it }
+        val dbSource = dao.getSourceById(sourceIdOrDomain) ?: dao.getSourceByDomain(sourceIdOrDomain)
+        if (dbSource != null) {
+            registry.findById(dbSource.id)?.let { return it }
+            registry.findByDomain(dbSource.domain)?.let { return it }
+        }
+        return null
+    }
+
+    override suspend fun validateSiteDomain(rawInput: String): Result<SourceValidationStepResult> {
         return validator.validateDomainCompatibility(rawInput)
     }
 
-    fun markDomainHumanVerified(domain: String) {
-        validator.markDomainHumanVerified(domain)
+    override fun getSourceVerificationState(sourceIdOrDomain: String): VerificationState {
+        return sourceManager.getVerificationStateForSource(sourceIdOrDomain)
+    }
+
+    override fun startSourceVerification(sourceId: String, domain: String): VerificationSession {
+        return verificationManager.startVerification(sourceId, domain)
+    }
+
+    override fun completeSourceVerification(
+        sourceId: String,
+        domain: String,
+        verifiedHtml: String?,
+        pageTitle: String
+    ): VerificationSession {
+        return verificationManager.completeVerification(
+            sourceId = sourceId,
+            domain = domain,
+            verifiedHtml = verifiedHtml,
+            pageTitle = pageTitle
+        )
+    }
+
+    override fun cancelSourceVerification(sourceId: String, domain: String): VerificationSession {
+        return verificationManager.cancelVerification(sourceId, domain)
+    }
+
+    override fun failSourceVerification(sourceId: String, domain: String, reasonAr: String): VerificationSession {
+        return verificationManager.failVerification(sourceId, domain, reasonAr)
+    }
+
+    fun markDomainHumanVerified(domain: String, verifiedHtml: String? = null) {
+        validator.markDomainHumanVerified(domain, verifiedHtml)
     }
 
     fun isDomainHumanVerified(domain: String): Boolean {
@@ -58,12 +193,12 @@ class MangaRepository(
         val connector = validationResult.matchedSource
             ?: return Result.failure(IllegalArgumentException("لا يمكن إضافة مصدر غير متوافق."))
 
-        // Prevent duplicate source registration (Rule 10 & Section 7)
         val existing = dao.getSourceByDomain(validationResult.normalizedDomain)
         val finalName = customSiteName.trim().ifEmpty { connector.name }
+        val sourceId = existing?.id ?: connector.id
 
         val entity = SourceEntity(
-            id = existing?.id ?: connector.id,
+            id = sourceId,
             name = finalName,
             domain = validationResult.normalizedDomain,
             baseUrl = connector.baseUrl,
@@ -80,7 +215,7 @@ class MangaRepository(
         dao.upsertSource(entity)
 
         // Pre-populate catalog into local DB so Unified Library / Recommendations / Search work immediately
-        refreshSourceCatalog(connector.id)
+        refreshSourceCatalog(sourceId, 1)
         return Result.success(entity.toDomain())
     }
 
@@ -100,6 +235,10 @@ class MangaRepository(
         }
     }
 
+    suspend fun getMangaBySourceOnce(sourceId: String): List<MangaSummary> {
+        return dao.getMangaBySourceOnce(sourceId).map { it.toSummary() }
+    }
+
     val storedMangaFlow: Flow<List<MangaSummary>> = dao.observeStoredManga().map { list ->
         list.map { it.toSummary() }
     }
@@ -109,59 +248,220 @@ class MangaRepository(
     }
 
     /**
-     * Fast catalog sync: fetches popular/latest summaries for [sourceId] and upserts them
-     * into Room WITHOUT firing sequential per-item getDetails() requests (which previously
-     * caused 60-90s loading spinners). Full details and chapters are fetched on-demand when
-     * opening a manga's details screen.
+     * Parses and persists manga items captured directly from an authenticated/verified WebView DOM.
+     */
+    suspend fun ingestVerifiedWebViewHtml(
+        sourceId: String,
+        html: String,
+        baseUrl: String
+    ): List<MangaSummary> {
+        val connector = resolveConnector(sourceId) ?: return emptyList()
+        val parsed = connector.parseVerifiedHtmlSnapshot(html, baseUrl)
+            .filter { it.title.isNotBlank() && it.mangaUrl.isNotBlank() }
+            .map { it.copy(sourceId = sourceId) }
+        if (parsed.isEmpty()) return emptyList()
+
+        val now = System.currentTimeMillis()
+        val entities = parsed.mapIndexed { idx, summary ->
+            val existing = dao.getMangaById(summary.id)
+            MangaEntity(
+                id = summary.id,
+                sourceId = sourceId,
+                remoteId = summary.mangaUrl,
+                title = summary.title.trim(),
+                coverUrl = summary.coverUrl?.takeIf { it.isNotBlank() } ?: existing?.coverUrl,
+                description = existing?.description.orEmpty(),
+                status = summary.status ?: existing?.status ?: "OnGoing",
+                author = existing?.author,
+                artist = existing?.artist,
+                genresCsv = if (summary.genres.isNotEmpty()) {
+                    summary.genres.joinToString(",")
+                } else {
+                    existing?.genresCsv.orEmpty()
+                },
+                rating = summary.rating ?: existing?.rating ?: 4.7f,
+                latestChapter = summary.latestChapter ?: existing?.latestChapter,
+                isSavedInStorage = existing?.isSavedInStorage ?: false,
+                updatedAt = now - idx * 10L
+            )
+        }
+        dao.upsertMangaList(entities)
+        verificationManager.markRequiresWebViewFallback(sourceId, connector.domain, false)
+        return getMangaBySourceOnce(sourceId).ifEmpty { parsed }
+    }
+
+    /**
+     * Fetches popular/latest summaries for [sourceId] from the registered [MangaSource] connector,
+     * logs every pipeline stage via [PipelineLogger], upserts the results into Room, and returns
+     * the full list of [MangaSummary] items for immediate ViewModel state update.
      */
     suspend fun refreshSourceCatalog(sourceId: String, page: Int = 1): Result<List<MangaSummary>> {
-        val connector = registry.findById(sourceId)
-            ?: return Result.failure(IllegalStateException("المصدر غير موجود"))
+        val connector = resolveConnector(sourceId)
+        if (connector == null) {
+            PipelineLogger.log(
+                stage = PipelineStage.SOURCE_FOUND_IN_REGISTRY,
+                sourceId = sourceId,
+                sourceName = sourceId,
+                resultCount = 0,
+                status = "FAILED",
+                failureReason = "Source '$sourceId' not found in SourceRegistry"
+            )
+            return Result.failure(IllegalStateException("المصدر ($sourceId) غير مسجل في النظام"))
+        }
+
+        connector.attachVerificationManager(verificationManager)
+
+        PipelineLogger.log(
+            stage = PipelineStage.SOURCE_FOUND_IN_REGISTRY,
+            sourceId = sourceId,
+            sourceName = connector.name,
+            resultCount = 1,
+            status = "FOUND",
+            details = "connectorId=${connector.id} domain=${connector.domain}"
+        )
 
         if (connector.requiresCloudflareVerification && !validator.isDomainHumanVerified(connector.domain)) {
-            return Result.failure(IllegalStateException("SECURITY_VERIFICATION_REQUIRED"))
+            val currentVerificationState = verificationManager.getState(connector.domain)
+            if (currentVerificationState == VerificationState.NOT_REQUIRED) {
+                verificationManager.markVerificationRequired(
+                    sourceId = sourceId,
+                    domain = connector.domain,
+                    challengeType = VerificationChallengeType.CLOUDFLARE_CHALLENGE,
+                    reasonAr = "يتطلب هذا الموقع إكمال التحقق الأمني"
+                )
+            }
+            PipelineLogger.log(
+                stage = PipelineStage.GET_POPULAR_CALLED,
+                sourceId = sourceId,
+                sourceName = connector.name,
+                resultCount = 0,
+                status = "BLOCKED_CLOUDFLARE",
+                failureReason = "SECURITY_VERIFICATION_REQUIRED (${verificationManager.getState(connector.domain)}) for ${connector.domain}"
+            )
+            return Result.failure(
+                VerificationRequiredException(
+                    sourceId = sourceId,
+                    domain = connector.domain,
+                    targetUrl = connector.baseUrl,
+                    detection = VerificationDetectionResult(
+                        isVerificationRequired = true,
+                        challengeType = VerificationChallengeType.CLOUDFLARE_CHALLENGE,
+                        httpCode = 403,
+                        reasonAr = verificationManager.getState(connector.domain).labelAr
+                    )
+                )
+            )
         }
 
         return try {
+            PipelineLogger.log(
+                stage = PipelineStage.GET_POPULAR_CALLED,
+                sourceId = sourceId,
+                sourceName = connector.name,
+                status = "CALLED",
+                details = "page=$page"
+            )
+
             val result = connector.getPopular(page)
-            val entities = result.items
+            val validItems = result.items
                 .filter { it.title.isNotBlank() && it.mangaUrl.isNotBlank() }
-                .map { summary ->
-                    val existing = dao.getMangaById(summary.id)
-                    MangaEntity(
-                        id = summary.id,
-                        sourceId = summary.sourceId,
-                        remoteId = summary.mangaUrl,
-                        title = summary.title.trim(),
-                        coverUrl = summary.coverUrl?.takeIf { it.isNotBlank() } ?: existing?.coverUrl,
-                        description = existing?.description.orEmpty(),
-                        status = summary.status ?: existing?.status ?: "OnGoing",
-                        author = existing?.author,
-                        artist = existing?.artist,
-                        genresCsv = if (summary.genres.isNotEmpty()) {
-                            summary.genres.joinToString(",")
-                        } else {
-                            existing?.genresCsv.orEmpty()
-                        },
-                        rating = summary.rating ?: existing?.rating ?: 4.6f,
-                        latestChapter = summary.latestChapter ?: existing?.latestChapter,
-                        isSavedInStorage = existing?.isSavedInStorage ?: false,
-                        updatedAt = System.currentTimeMillis()
-                    )
-                }
+                .map { it.copy(sourceId = sourceId) }
+
+            PipelineLogger.log(
+                stage = PipelineStage.MANGA_RESULTS_RECEIVED,
+                sourceId = sourceId,
+                sourceName = connector.name,
+                resultCount = validItems.size,
+                status = if (validItems.isNotEmpty()) "SUCCESS" else "EMPTY",
+                failureReason = if (validItems.isEmpty()) "getPopular($page) returned 0 valid items" else null
+            )
+
+            val now = System.currentTimeMillis()
+            val entities = validItems.mapIndexed { idx, summary ->
+                val existing = dao.getMangaById(summary.id)
+                MangaEntity(
+                    id = summary.id,
+                    sourceId = sourceId,
+                    remoteId = summary.mangaUrl,
+                    title = summary.title.trim(),
+                    coverUrl = summary.coverUrl?.takeIf { it.isNotBlank() } ?: existing?.coverUrl,
+                    description = existing?.description.orEmpty(),
+                    status = summary.status ?: existing?.status ?: "OnGoing",
+                    author = existing?.author,
+                    artist = existing?.artist,
+                    genresCsv = if (summary.genres.isNotEmpty()) {
+                        summary.genres.joinToString(",")
+                    } else {
+                        existing?.genresCsv.orEmpty()
+                    },
+                    rating = summary.rating ?: existing?.rating ?: 4.7f,
+                    latestChapter = summary.latestChapter ?: existing?.latestChapter,
+                    isSavedInStorage = existing?.isSavedInStorage ?: false,
+                    updatedAt = now - idx * 10L
+                )
+            }
+
             if (entities.isNotEmpty()) {
                 dao.upsertMangaList(entities)
             }
-            Result.success(result.items)
-        } catch (e: Exception) {
+
+            val allStoredForSource = getMangaBySourceOnce(sourceId)
+            val finalItems = if (allStoredForSource.isNotEmpty()) allStoredForSource else validItems
+
+            PipelineLogger.log(
+                stage = PipelineStage.REPOSITORY_UPDATED,
+                sourceId = sourceId,
+                sourceName = connector.name,
+                resultCount = finalItems.size,
+                status = if (finalItems.isNotEmpty()) "UPSERTED" else "EMPTY",
+                details = "newlyUpserted=${entities.size} totalInDb=${allStoredForSource.size}"
+            )
+
+            if (finalItems.isEmpty()) {
+                if (verificationManager.isVerified(connector.domain)) {
+                    verificationManager.markRequiresWebViewFallback(sourceId, connector.domain, true)
+                    Result.failure(IllegalStateException("NO_CONTENT_AFTER_VERIFICATION"))
+                } else {
+                    Result.failure(IllegalStateException("لم يُعثر على أي أعمال من المصدر ${connector.name}"))
+                }
+            } else {
+                verificationManager.markRequiresWebViewFallback(sourceId, connector.domain, false)
+                Result.success(finalItems)
+            }
+        } catch (e: VerificationRequiredException) {
+            PipelineLogger.log(
+                stage = PipelineStage.REPOSITORY_UPDATED,
+                sourceId = sourceId,
+                sourceName = connector.name,
+                resultCount = 0,
+                status = "VERIFICATION_REQUIRED",
+                failureReason = e.detection.reasonAr,
+                throwable = e
+            )
             Result.failure(e)
+        } catch (e: Exception) {
+            val cached = getMangaBySourceOnce(sourceId)
+            PipelineLogger.log(
+                stage = PipelineStage.REPOSITORY_UPDATED,
+                sourceId = sourceId,
+                sourceName = connector.name,
+                resultCount = cached.size,
+                status = if (cached.isNotEmpty()) "CACHED_FALLBACK" else "FAILED",
+                failureReason = "${e.javaClass.simpleName}: ${e.message}",
+                throwable = e
+            )
+            if (cached.isNotEmpty()) {
+                Result.success(cached)
+            } else {
+                Result.failure(e)
+            }
         }
     }
 
     suspend fun loadMangaDetailsAndSyncChapters(mangaId: String): Result<MangaDetails> {
         val mangaEntity = dao.getMangaById(mangaId)
             ?: return Result.failure(IllegalStateException("لم يتم العثور على المانهوا"))
-        val connector = registry.findById(mangaEntity.sourceId)
+        val connector = resolveConnector(mangaEntity.sourceId)
 
         return try {
             if (connector == null) {
@@ -171,7 +471,6 @@ class MangaRepository(
 
             val remoteDetails = connector.getDetails(mangaEntity.remoteId)
 
-            // Update cached MangaEntity with newly fetched metadata & cover
             val updatedEntity = mangaEntity.copy(
                 title = remoteDetails.title.ifBlank { mangaEntity.title },
                 coverUrl = remoteDetails.coverUrl?.takeIf { it.isNotBlank() } ?: mangaEntity.coverUrl,
@@ -212,13 +511,14 @@ class MangaRepository(
             val updatedChapters = dao.getChaptersByMangaOnce(mangaId).map { it.toDomain() }
             Result.success(
                 remoteDetails.copy(
+                    id = mangaId,
+                    sourceId = mangaEntity.sourceId,
                     coverUrl = updatedEntity.coverUrl,
                     description = updatedEntity.description,
                     chapters = updatedChapters
                 )
             )
         } catch (e: Exception) {
-            // Offline fallback: return cached Room details & chapters if available
             val cachedChapters = dao.getChaptersByMangaOnce(mangaId).map { it.toDomain() }
             if (cachedChapters.isNotEmpty() || mangaEntity.description.isNotBlank()) {
                 Result.success(mangaEntity.toDetails(cachedChapters))
@@ -236,14 +536,14 @@ class MangaRepository(
 
     fun observeMangaEntity(mangaId: String): Flow<MangaEntity?> = dao.observeMangaById(mangaId)
 
-    // ─── READER & OFFLINE PAGES (Rule 6, 8, 9, 13) ───
+    // ─── READER & OFFLINE PAGES ───
     suspend fun getReaderPages(chapterId: String): Result<List<MangaPage>> {
         val chapter = dao.getChapterById(chapterId)
             ?: return Result.failure(IllegalStateException("الفصل غير موجود"))
         val manga = dao.getMangaById(chapter.mangaId)
-        val connector = registry.findById(chapter.sourceId)
+        val connector = resolveConnector(chapter.sourceId)
 
-        // Check offline downloaded files first (Section 13: Offline reading without unnecessary network calls)
+        // Check offline downloaded files first
         val cachedPages = dao.getPagesForChapter(chapterId)
         if (cachedPages.isNotEmpty() && cachedPages.all { !it.localPath.isNullOrBlank() && File(it.localPath).exists() }) {
             return Result.success(
@@ -264,7 +564,6 @@ class MangaRepository(
             return Result.failure(IllegalStateException("CHAPTER_EMPTY"))
         }
 
-        // Materialize local cached page images so native reader renders crisp vertical webtoon art
         val resolvedPages = remotePages.map { p ->
             val fileRes = storage.downloadAndSavePage(
                 sourceId = chapter.sourceId,
