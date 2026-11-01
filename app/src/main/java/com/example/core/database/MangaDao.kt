@@ -33,6 +33,9 @@ interface MangaDao {
     @Query("DELETE FROM sources WHERE id = :sourceId")
     suspend fun deleteSource(sourceId: String)
 
+    @Query("DELETE FROM sources")
+    suspend fun clearAllSources()
+
     // ─── MANGA ───
     @Query("SELECT * FROM manga WHERE sourceId = :sourceId ORDER BY updatedAt DESC")
     fun observeMangaBySource(sourceId: String): Flow<List<MangaEntity>>

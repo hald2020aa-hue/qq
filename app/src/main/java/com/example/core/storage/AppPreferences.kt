@@ -79,6 +79,17 @@ class AppPreferences(private val context: Context) {
         val GRID_DISPLAY_MODE = stringPreferencesKey("grid_display_mode")
         val FAVORITE_CATEGORIES = stringPreferencesKey("favorite_categories")
         val VERIFICATION_SESSIONS_METADATA = stringPreferencesKey("verification_sessions_metadata")
+        val INITIAL_SOURCES_CLEARED_V2 = booleanPreferencesKey("initial_sources_cleared_v2")
+    }
+
+    val initialSourcesClearedFlow: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.INITIAL_SOURCES_CLEARED_V2] ?: false
+    }
+
+    suspend fun markInitialSourcesCleared() {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.INITIAL_SOURCES_CLEARED_V2] = true
+        }
     }
 
     val verificationSessionsMetadataFlow: Flow<String> = context.dataStore.data.map { prefs ->

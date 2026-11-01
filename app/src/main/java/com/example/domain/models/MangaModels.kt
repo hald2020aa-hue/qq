@@ -1,13 +1,50 @@
 package com.example.domain.models
 
 enum class SourceStatus(val labelAr: String) {
-    SUPPORTED("مدعوم"),
-    UNSUPPORTED("غير مدعوم"),
+    SUPPORTED("مدعوم (SUPPORTED)"),
+    NEEDS_VERIFICATION("يتطلب تحققاً أمنياً (NEEDS_VERIFICATION)"),
+    NEEDS_ADAPTER("يحتاج إلى موصل (NEEDS_ADAPTER)"),
+    WEBVIEW_ONLY("عرض عبر المتصفح فقط (WEBVIEW_ONLY)"),
+    NETWORK_ERROR("خطأ في الشبكة (NETWORK_ERROR)"),
+    PARSING_ERROR("خطأ في الاستخراج (PARSING_ERROR)"),
+    UNSUPPORTED("غير مدعوم (UNSUPPORTED)"),
     NEEDS_UPDATE("يحتاج إلى تحديث"),
     REQUIRES_VERIFICATION("يتطلب تحققاً أمنياً"),
     DISABLED("معطل"),
     ERROR("خطأ في المصدر")
 }
+
+enum class SourceCapability(val labelAr: String) {
+    POPULAR_MANGA("قائمة الأعمال الشائعة"),
+    LATEST_UPDATES("آخر التحديثات"),
+    SEARCH_MANGA("البحث في الأعمال"),
+    MANGA_DETAILS("تفاصيل العمل"),
+    MANGA_CHAPTERS("قائمة الفصول"),
+    CHAPTER_PAGES("صفحات الفصل"),
+    PAGINATION("تعدد الصفحات"),
+    CATEGORIES("التصنيفات والفئات"),
+    FILTERS("الفرز والتصفية")
+}
+
+data class SourceDiagnosticReport(
+    val sourceId: String,
+    val sourceName: String,
+    val domain: String,
+    val connectionStatusAr: String,
+    val verificationStatusAr: String,
+    val adapterStatus: SourceStatus,
+    val siteArchitecture: String = "HTML",
+    val extractedMangaCount: Int = 0,
+    val sampleCoverUrl: String? = null,
+    val imagesStatusOk: Boolean = false,
+    val chaptersStatusOk: Boolean = false,
+    val extractedChaptersCount: Int = 0,
+    val pagesStatusOk: Boolean = false,
+    val extractedPagesCount: Int = 0,
+    val capabilities: Set<SourceCapability> = emptySet(),
+    val lastError: String? = null,
+    val lastTestedAt: Long = System.currentTimeMillis()
+)
 
 enum class DownloadStatus(val labelAr: String) {
     WAITING("في الانتظار"),

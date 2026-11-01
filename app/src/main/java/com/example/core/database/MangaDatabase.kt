@@ -44,6 +44,7 @@ abstract class MangaDatabase : RoomDatabase() {
                     "manga_reader.db"
                 )
                     .addMigrations(MIGRATION_1_2)
+                    .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }
             }

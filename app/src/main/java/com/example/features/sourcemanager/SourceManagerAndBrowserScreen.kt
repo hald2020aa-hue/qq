@@ -8,7 +8,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,21 +23,21 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.CheckBox
-import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -65,7 +64,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
@@ -79,9 +77,15 @@ import androidx.compose.ui.window.Dialog
 import com.example.R
 import com.example.core.common.isInternalOrLocalAddress
 import com.example.core.verification.VerificationWebView
+import com.example.domain.models.SourceDiagnosticReport
 import com.example.domain.models.SourceInfo
+import com.example.domain.models.SourceStatus
 import com.example.features.AddSiteDialogState
 import com.example.features.navigation.SourceBadgeIcon
+import java.net.URLDecoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun SourceManagerScreen(
@@ -92,11 +96,13 @@ fun SourceManagerScreen(
     onOpenBrowser: (String) -> Unit,
     onToggleSource: (String, Boolean) -> Unit,
     onDeleteSource: (String) -> Unit,
-    onOpenSourceCatalog: (String) -> Unit
+    onOpenSourceCatalog: (String) -> Unit,
+    onOpenDiagnostics: () -> Unit = {},
+    onClearAllSources: () -> Unit = {}
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Bar matching Video 1 (00:01 & 00:50): Title "إدارة المواقع", Back arrow, and Browser + Add icons when sources exist
+            // Top Bar matching Video 1 (00:01 & 00:50): Title "إدارة المواقع", Back arrow, Diagnostics, Browser & Add icons
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -121,8 +127,17 @@ fun SourceManagerScreen(
                     )
                 }
 
-                if (sources.isNotEmpty()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onOpenDiagnostics,
+                        modifier = Modifier.testTag("top_diagnostics_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Analytics,
+                            contentDescription = "تشخيص المصادر"
+                        )
+                    }
+                    if (sources.isNotEmpty()) {
                         IconButton(
                             onClick = { onOpenAddSiteDialog("") },
                             modifier = Modifier.testTag("top_add_site_button")
@@ -141,12 +156,22 @@ fun SourceManagerScreen(
                                 contentDescription = "المتصفح"
                             )
                         }
+                        IconButton(
+                            onClick = onClearAllSources,
+                            modifier = Modifier.testTag("top_clear_all_sources_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.DeleteSweep,
+                                contentDescription = "حذف جميع المواقع"
+                            )
+                        }
                     }
                 }
             }
 
             if (sources.isEmpty()) {
                 // Exact Empty State from Video 1 (00:01): Puzzle icon + "لم تضف أي مواقع بعد" + "إضافة موقع" + "المتصفح"
+                // No hardcoded/preset websites — user adds their sites manually.
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -195,33 +220,6 @@ fun SourceManagerScreen(
                             Icon(Icons.Default.Language, contentDescription = null)
                             Spacer(modifier = Modifier.width(8.dp))
                             Text("المتصفح", style = MaterialTheme.typography.titleSmall)
-                        }
-
-                        Spacer(modifier = Modifier.height(28.dp))
-                        // Quick preset chips for testing domains shown in the videos
-                        Text(
-                            text = "نطاقات متوافقة جاهزة للفحص السريع:",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            listOf("mangalik.net", "olympustaff.com", "mangatek.com").forEach { domain ->
-                                Surface(
-                                    onClick = { onOpenAddSiteDialog(domain) },
-                                    shape = RoundedCornerShape(14.dp),
-                                    color = MaterialTheme.colorScheme.surfaceVariant
-                                ) {
-                                    Text(
-                                        text = domain,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                    )
-                                }
-                            }
                         }
                     }
                 }
@@ -298,6 +296,13 @@ fun SourceManagerScreen(
                                             }
                                         )
                                         DropdownMenuItem(
+                                            text = { Text("تشخيص المصدر") },
+                                            onClick = {
+                                                showMenu = false
+                                                onOpenDiagnostics()
+                                            }
+                                        )
+                                        DropdownMenuItem(
                                             text = { Text("فتح في المتصفح الداخلي") },
                                             onClick = {
                                                 showMenu = false
@@ -343,8 +348,202 @@ fun SourceManagerScreen(
 }
 
 /**
+ * Problem 9: Dedicated Source Diagnostics Screen (`شاشة تشخيص المصادر`).
+ * Displays for each source:
+ * - اسم المصدر (Source Name)
+ * - النطاق (Domain)
+ * - حالة الاتصال (Connection Status)
+ * - حالة التحقق (Verification Status)
+ * - حالة الموصل (Adapter Status: SUPPORTED, NEEDS_VERIFICATION, NEEDS_ADAPTER, WEBVIEW_ONLY, NETWORK_ERROR, PARSING_ERROR, UNSUPPORTED)
+ * - عدد الأعمال المستخرجة (Extracted Manga Count)
+ * - حالة الصور (Images Status)
+ * - حالة الفصول (Chapters Status)
+ * - آخر خطأ (Last Error)
+ * - آخر اختبار (Last Test Timestamp)
+ */
+@Composable
+fun SourceDiagnosticsScreen(
+    sources: List<SourceInfo>,
+    reports: Map<String, SourceDiagnosticReport>,
+    isRunningDiagnostics: Boolean,
+    onNavigateBack: () -> Unit,
+    onRunSingleDiagnostic: (String) -> Unit,
+    onRunAllDiagnostics: () -> Unit
+) {
+    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = onNavigateBack,
+                    modifier = Modifier.testTag("diagnostics_back_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "رجوع"
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "تشخيص المصادر",
+                    style = MaterialTheme.typography.headlineMedium
+                )
+            }
+
+            if (sources.isNotEmpty()) {
+                Button(
+                    onClick = onRunAllDiagnostics,
+                    enabled = !isRunningDiagnostics,
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.testTag("run_all_diagnostics_button")
+                ) {
+                    if (isRunningDiagnostics) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                    } else {
+                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("فحص الكل")
+                }
+            }
+        }
+
+        if (sources.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "لا توجد مواقع مضافة حالياً. قم بإضافة موقع من «إدارة المواقع» أولاً ثم افحصه هنا.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+            }
+        } else {
+            LazyColumn(
+                contentPadding = PaddingValues(14.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .testTag("diagnostics_list")
+            ) {
+                items(sources, key = { it.id }) { src ->
+                    val report = reports[src.id]
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                    SourceBadgeIcon(text = src.iconText, colorHex = src.iconColorHex, sizeDp = 36)
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column {
+                                        Text(
+                                            text = "اسم المصدر: ${src.name}",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = "النطاق: ${src.domain}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = { onRunSingleDiagnostic(src.id) },
+                                    enabled = !isRunningDiagnostics,
+                                    shape = RoundedCornerShape(14.dp),
+                                    modifier = Modifier.testTag("diagnose_source_${src.id}")
+                                ) {
+                                    Text("فحص المصدر")
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            val adapterStatus = report?.adapterStatus ?: src.status
+                            DiagnosticRow("حالة الاتصال", report?.connectionStatusAr ?: "في انتظار الفحص")
+                            DiagnosticRow("حالة التحقق", report?.verificationStatusAr ?: "غير مطلوب")
+                            DiagnosticRow("حالة الموصل", "${adapterStatus.name} (${adapterStatus.labelAr})")
+                            DiagnosticRow("عدد الأعمال المستخرجة", "${report?.extractedMangaCount ?: 0}")
+                            DiagnosticRow(
+                                "حالة الصور",
+                                if (report == null) "لم يُختبر بعد" else if (report.imagesStatusOk) "صالحة (${report.sampleCoverUrl?.take(36)}...)" else "مفقودة"
+                            )
+                            DiagnosticRow(
+                                "حالة الفصول",
+                                if (report == null) "لم يُختبر بعد" else if (report.chaptersStatusOk) "متاحة (${report.extractedChaptersCount} فصل)" else "غير متاحة"
+                            )
+                            DiagnosticRow(
+                                "آخر خطأ",
+                                report?.lastError ?: "لا يوجد"
+                            )
+                            DiagnosticRow(
+                                "آخر اختبار",
+                                dateFormat.format(Date(report?.lastTestedAt ?: src.lastCheckedAt))
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/**
  * Dialogs for Adding a Site, Checking Compatibility, Manual Site Name Confirmation,
- * and Cloudflare Human Verification (Video 1, 2, 3, 4).
+ * and Cloudflare Human Verification.
  */
 @Composable
 fun AddSiteAndVerificationDialogs(
@@ -360,7 +559,7 @@ fun AddSiteAndVerificationDialogs(
 ) {
     val clipboard = LocalClipboardManager.current
 
-    // 1. Primary "إضافة موقع" Dialog (Video 1 00:33 & Video 2 00:15)
+    // 1. Primary "إضافة موقع" Dialog
     if (state.isVisible && !state.showManualConfirmDialog && !state.showCloudflareDialog) {
         Dialog(onDismissRequest = onDismiss) {
             Surface(
@@ -389,7 +588,9 @@ fun AddSiteAndVerificationDialogs(
                         IconButton(
                             onClick = {
                                 val clipText = clipboard.getText()?.text.orEmpty()
-                                onInputChanged(clipText.ifBlank { "mangalik.net" })
+                                if (clipText.isNotBlank()) {
+                                    onInputChanged(clipText)
+                                }
                             },
                             modifier = Modifier.testTag("paste_domain_button")
                         ) {
@@ -417,28 +618,6 @@ fun AddSiteAndVerificationDialogs(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-
-                    // Quick suggestion pills for 1-tap testing
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        listOf("mangalik.net", "olympustaff.com", "mangatek.com").forEach { preset ->
-                            Surface(
-                                onClick = { onInputChanged(preset) },
-                                shape = RoundedCornerShape(10.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant
-                            ) {
-                                Text(
-                                    text = preset,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                                )
-                            }
-                        }
-                    }
 
                     if (state.isChecking) {
                         Spacer(modifier = Modifier.height(14.dp))
@@ -489,7 +668,7 @@ fun AddSiteAndVerificationDialogs(
         }
     }
 
-    // 2. Manual Site Name Confirmation Dialog ("إضافة موقع يدوياً" - Video 1 00:42 & Video 2 00:28)
+    // 2. Manual Site Name Confirmation Dialog ("إضافة موقع يدوياً")
     if (state.showManualConfirmDialog) {
         val connector = state.pendingValidationResult?.matchedSource
         Dialog(onDismissRequest = onDismiss) {
@@ -561,7 +740,7 @@ fun AddSiteAndVerificationDialogs(
         }
     }
 
-    // 3. Universal Website Verification WebView Dialog (Section 3 & Video 00:06 - 00:14)
+    // 3. Universal Website Verification WebView Dialog
     if (state.showCloudflareDialog) {
         VerificationWebView(
             domain = state.cloudflareDomain,
@@ -579,7 +758,8 @@ fun AddSiteAndVerificationDialogs(
 }
 
 /**
- * Section 9 & Video 1 (00:03 - 00:46): Secure Internal WebView Browser with Floating "إضافة موقع" Button.
+ * Secure Internal WebView Browser with Floating "إضافة موقع" Button.
+ * Supports real navigation for any website or Google search result without hardcoded site intercepts.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -589,22 +769,14 @@ fun InternalBrowserScreen(
     onAddCurrentDomain: (String) -> Unit
 ) {
     var currentUrl by remember { mutableStateOf(initialUrl) }
-    var pageTitle by remember { mutableStateOf("Google") }
+    var pageTitle by remember { mutableStateOf("المتصفح") }
     var searchInput by remember { mutableStateOf(initialUrl) }
     var isEditingUrl by remember { mutableStateOf(false) }
     var showOverflow by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
 
-    val quickSites = listOf(
-        "مانجا ليك Mangalek" to "https://mangalik.net/",
-        "Team-X" to "https://olympustaff.com/",
-        "مانجاتك Mangatek" to "https://mangatek.com/",
-        "ازورا مانجا" to "https://azoramanga.com/"
-    )
-
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Browser Top Bar matching Video 1 (00:21): Close X on right, Title & URL in middle, Search & 3-dot on left
             Surface(
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 4.dp,
@@ -693,10 +865,8 @@ fun InternalBrowserScreen(
                             Button(onClick = {
                                 val q = searchInput.trim()
                                 currentUrl = when {
-                                    q.contains("mangalik") || q.contains("مانجا ليك") -> "https://mangalik.net/"
-                                    q.contains("olympus") || q.contains("team") -> "https://olympustaff.com/"
-                                    q.contains("mangatek") || q.contains("مانجاتك") -> "https://mangatek.com/"
                                     q.startsWith("https://") -> q
+                                    q.startsWith("http://") -> "https://" + q.removePrefix("http://")
                                     q.contains(".") && !q.contains(" ") -> "https://$q"
                                     else -> "https://www.google.com/search?q=$q"
                                 }
@@ -706,101 +876,91 @@ fun InternalBrowserScreen(
                             }
                         }
                     }
-
-                    // Quick Bookmarks Strip inside Browser for effortless testing
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        quickSites.forEach { (label, url) ->
-                            Surface(
-                                onClick = {
-                                    currentUrl = url
-                                    searchInput = url
-                                    pageTitle = label
-                                },
-                                shape = RoundedCornerShape(14.dp),
-                                color = if (currentUrl == url) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
-                            ) {
-                                Text(
-                                    text = label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                )
-                            }
-                        }
-                    }
                 }
             }
 
-            // Simulated / Secure WebView Preview Area
-            if (currentUrl.contains("mangalik.net") || currentUrl.contains("olympustaff.com") || currentUrl.contains("mangatek.com") || currentUrl.contains("azoramanga.com")) {
-                // High-fidelity interactive site preview matching Video 1 (00:22) so user can inspect and click "+ إضافة موقع" even if external site blocks WebView
-                BrowserSitePreviewContent(
-                    currentUrl = currentUrl,
-                    onSelectSiteUrl = { url, title ->
-                        currentUrl = url
-                        pageTitle = title
-                    }
-                )
-            } else {
-                AndroidView(
-                    factory = { context ->
-                        WebView(context).apply {
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.allowFileAccess = false
-                            settings.allowContentAccess = false
-                            webChromeClient = WebChromeClient()
-                            webViewClient = object : WebViewClient() {
-                                override fun shouldOverrideUrlLoading(
-                                    view: WebView?,
-                                    request: WebResourceRequest?
-                                ): Boolean {
-                                    val reqUrl = request?.url ?: return true
-                                    val scheme = reqUrl.scheme?.lowercase() ?: ""
-                                    val host = reqUrl.host?.lowercase() ?: ""
-                                    // Rule 16: Block non-HTTPS schemes and internal/local hosts
-                                    if (scheme != "https" || isInternalOrLocalAddress(host)) {
+            AndroidView(
+                factory = { context ->
+                    WebView(context).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.allowFileAccess = false
+                        settings.allowContentAccess = false
+                        settings.setSupportMultipleWindows(false)
+                        webChromeClient = WebChromeClient()
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView?,
+                                request: WebResourceRequest?
+                            ): Boolean {
+                                val reqUrl = request?.url ?: return true
+                                val rawUrlStr = reqUrl.toString()
+
+                                // Unwrap Google Search redirect links (/url?q=...) so single tap opens the target site immediately
+                                if (reqUrl.host?.contains("google.") == true && reqUrl.path == "/url") {
+                                    val targetQ = reqUrl.getQueryParameter("q") ?: reqUrl.getQueryParameter("url")
+                                    if (!targetQ.isNullOrBlank() && targetQ.startsWith("http")) {
+                                        val httpsTarget = if (targetQ.startsWith("http://")) {
+                                            "https://" + targetQ.removePrefix("http://")
+                                        } else {
+                                            targetQ
+                                        }
+                                        currentUrl = httpsTarget
+                                        searchInput = httpsTarget
+                                        view?.loadUrl(httpsTarget)
                                         return true
                                     }
-                                    currentUrl = reqUrl.toString()
-                                    return false
                                 }
 
-                                override fun onReceivedSslError(
-                                    view: WebView?,
-                                    handler: SslErrorHandler?,
-                                    error: SslError?
-                                ) {
-                                    // Rule 9: Strictly reject invalid SSL certificates
-                                    handler?.cancel()
+                                val scheme = reqUrl.scheme?.lowercase() ?: ""
+                                val host = reqUrl.host?.lowercase() ?: ""
+                                if (scheme == "http" && !isInternalOrLocalAddress(host)) {
+                                    val upgraded = "https://" + rawUrlStr.removePrefix("http://")
+                                    currentUrl = upgraded
+                                    searchInput = upgraded
+                                    view?.loadUrl(upgraded)
+                                    return true
                                 }
-
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    if (!url.isNullOrBlank()) currentUrl = url
-                                    if (!view?.title.isNullOrBlank()) pageTitle = view?.title.orEmpty()
+                                if (scheme != "https" || isInternalOrLocalAddress(host)) {
+                                    return true
                                 }
+                                currentUrl = rawUrlStr
+                                searchInput = rawUrlStr
+                                return false
                             }
-                            loadUrl(currentUrl)
+
+                            override fun onReceivedSslError(
+                                view: WebView?,
+                                handler: SslErrorHandler?,
+                                error: SslError?
+                            ) {
+                                handler?.cancel()
+                            }
+
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                if (!url.isNullOrBlank()) {
+                                    currentUrl = url
+                                    searchInput = url
+                                }
+                                if (!view?.title.isNullOrBlank()) pageTitle = view?.title.orEmpty()
+                            }
                         }
-                    },
-                    update = { webView ->
-                        if (webView.url != currentUrl) {
-                            webView.loadUrl(currentUrl)
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                )
-            }
+                        loadUrl(currentUrl)
+                    }
+                },
+                update = { webView ->
+                    if (webView.url != currentUrl && !currentUrl.startsWith("javascript:")) {
+                        webView.loadUrl(currentUrl)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            )
         }
 
-        // Floating "+ إضافة موقع" Button in bottom-left matching Video 1 (00:27 - 00:46)
+        // Floating "+ إضافة موقع" Button in bottom corner
         Button(
             onClick = { onAddCurrentDomain(currentUrl) },
             shape = RoundedCornerShape(16.dp),
@@ -817,67 +977,6 @@ fun InternalBrowserScreen(
             Icon(Icons.Default.PlaylistAdd, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
             Text("إضافة موقع", style = MaterialTheme.typography.titleSmall)
-        }
-    }
-}
-
-@Composable
-private fun BrowserSitePreviewContent(
-    currentUrl: String,
-    onSelectSiteUrl: (String, String) -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFFF3F4F6))
-    ) {
-        // Blue Site Header bar matching mangalik.net in Video 1 (00:22)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF2563EB))
-                .padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = currentUrl.removePrefix("https://").trimEnd('/'),
-                style = MaterialTheme.typography.titleMedium,
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = "اضغط «إضافة موقع» بالأسفل لربط النطاق بالتطبيق",
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFFDBEAFE)
-            )
-        }
-
-        LazyColumn(
-            contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            item {
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            text = "معاينة المتصفح الداخلي (${currentUrl})",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Color(0xFF111827)
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "يمكنك الآن الضغط على زر «+ إضافة موقع» في أسفل الشاشة لفحص توافق النطاق وإضافته إلى قائمة مصادرك تماماً كما ظهر في الفيديو المرجعي.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color(0xFF4B5563)
-                        )
-                    }
-                }
-            }
         }
     }
 }

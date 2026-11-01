@@ -223,6 +223,12 @@ fun MangaDrawerSheet(
                 }
             } else {
                 Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "لم تضف أي مواقع بعد",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
                 Button(
                     onClick = onQuickAddDemoSources,
                     colors = ButtonDefaults.buttonColors(
@@ -236,7 +242,7 @@ fun MangaDrawerSheet(
                         .testTag("quick_add_sources_button")
                 ) {
                     Text(
-                        text = "+ تفعيل المصادر السريعة (Mangalek / Team-X)",
+                        text = "+ إضافة موقع يدوياً",
                         style = MaterialTheme.typography.labelMedium
                     )
                 }

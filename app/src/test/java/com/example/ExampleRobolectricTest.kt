@@ -144,16 +144,8 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `mangaRepository refreshSourceCatalog persists live items to Room and logs pipeline stages`() = runBlocking {
-        val registry = SourceRegistry(
-            listOf(
-                com.example.sources.MangalekSource(),
-                com.example.sources.TeamXSource(),
-                com.example.sources.MangatekSource(),
-                com.example.sources.AzoraMangaSource(),
-                com.example.sources.MangaDexSource()
-            )
-        )
+    fun `mangaRepository starts with zero preinstalled sources and adds sites manually`() = runBlocking {
+        val registry = SourceRegistry(emptyList())
         val validator = SourceValidator(registry)
         val storage = com.example.core.storage.LocalChapterStorage(context)
         val downloadEngine = com.example.core.downloads.DownloadEngine(context, db, storage, registry)
@@ -168,22 +160,21 @@ class ExampleRobolectricTest {
         com.example.core.common.PipelineLogger.clear()
         repository.ensureDefaultSourcesRegistered()
 
-        val registeredSourcesInDb = db.mangaDao().getAllSourcesOnce()
-        assertEquals(5, registeredSourcesInDb.size)
+        // Must start with 0 pre-added sources in Room!
+        val initialSourcesInDb = db.mangaDao().getAllSourcesOnce()
+        assertEquals(0, initialSourcesInDb.size)
 
-        val refreshResult = repository.refreshSourceCatalog("mangalek", 1)
-        assertTrue("refreshSourceCatalog must succeed", refreshResult.isSuccess)
-        val items = refreshResult.getOrThrow()
-        assertTrue("Returned items must not be empty", items.isNotEmpty())
+        // Now user manually validates and adds a site (e.g., mangalik.net)
+        val validation = repository.validateSiteDomain("mangalik.net").getOrThrow()
+        val addRes = repository.confirmAndAddSource(validation, "مانجا ليك")
+        assertTrue("Manual site addition must succeed", addRes.isSuccess)
 
-        val storedInRoom = repository.getMangaBySourceOnce("mangalek")
-        assertTrue("Room database must contain synced manga for mangalek", storedInRoom.isNotEmpty())
+        val sourcesAfterManualAdd = db.mangaDao().getAllSourcesOnce()
+        assertEquals(1, sourcesAfterManualAdd.size)
+        assertEquals("mangalik.net", sourcesAfterManualAdd.first().domain)
 
-        val stageLogs = com.example.core.common.PipelineLogger.getLogsForSource("mangalek")
-        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.SOURCE_FOUND_IN_REGISTRY })
-        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.GET_POPULAR_CALLED })
-        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.MANGA_RESULTS_RECEIVED })
-        assertTrue(stageLogs.any { it.stage == com.example.core.common.PipelineStage.REPOSITORY_UPDATED })
+        val storedInRoom = repository.getMangaBySourceOnce(sourcesAfterManualAdd.first().id)
+        assertTrue("Room database must contain synced manga for manually added site", storedInRoom.isNotEmpty())
     }
 
     @Test

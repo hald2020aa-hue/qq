@@ -12,15 +12,38 @@ import java.util.Locale
  * - Strips paths, query parameters, and fragments, returning only the normalized domain
  */
 fun normalizeDomain(input: String): String {
-    val trimmed = input.trim().lowercase(Locale.ROOT)
+    var trimmed = input
+        .replace("\u200E", "")
+        .replace("\u200F", "")
+        .replace("\u202A", "")
+        .replace("\u202B", "")
+        .replace("\u202C", "")
+        .trim()
+        .trimStart('/', '\\', ' ')
+        .trimEnd('/', '\\', ' ')
+        .lowercase(Locale.ROOT)
+
+    // Handle cases where RTL copy-paste putsscheme at the end or prefixes with slash (e.g., /https://starzmanga.com)
+    if (trimmed.startsWith("https:/") && !trimmed.startsWith("https://")) {
+        trimmed = "https://" + trimmed.removePrefix("https:/").trimStart('/')
+    }
+    if (trimmed.endsWith("://https")) {
+        trimmed = "https://" + trimmed.removeSuffix("://https").trim('/')
+    }
+
     require(trimmed.isNotBlank()) { "الرابط فارغ. يرجى إدخال نطاق موقع صحيح." }
 
     // Reject explicitly unsafe schemes
-    val forbiddenSchemes = listOf("http://", "javascript:", "file:", "data:", "ftp:", "intent:", "content:")
+    val forbiddenSchemes = listOf("javascript:", "file:", "data:", "ftp:", "intent:", "content:")
     for (scheme in forbiddenSchemes) {
         if (trimmed.startsWith(scheme)) {
             throw IllegalArgumentException("مخطط الرابط غير آمن ($scheme). يُسمح فقط بروابط HTTPS الآمنة.")
         }
+    }
+
+    // Upgrade http:// to https:// automatically so user-pasted http links work seamlessly over HTTPS
+    if (trimmed.startsWith("http://")) {
+        trimmed = "https://" + trimmed.removePrefix("http://")
     }
 
     val urlWithScheme = if (trimmed.startsWith("https://")) {
@@ -32,16 +55,17 @@ fun normalizeDomain(input: String): String {
     }
 
     val uri = try {
-        URI(urlWithScheme)
+        URI(urlWithScheme.substringBefore(' ').substringBefore('?').substringBefore('#'))
     } catch (e: Exception) {
         throw IllegalArgumentException("صيغة الرابط غير صالحة.")
     }
 
-    val rawHost = uri.host ?: throw IllegalArgumentException("تعذّر استخراج النطاق من الرابط المدخل.")
-    val host = rawHost.removePrefix("www.").trim('.')
+    val rawHost = uri.host
+        ?: urlWithScheme.removePrefix("https://").substringBefore('/').substringBefore('?').substringBefore('#')
+    val host = rawHost.removePrefix("www.").trim('.').trim()
 
     require(host.isNotBlank() && host.contains('.')) {
-        "يرجى إدخال اسم نطاق صالح (مثال: mangalik.net)."
+        "يرجى إدخال اسم نطاق صالح (مثال: starzmanga.com)."
     }
 
     // Reject localhost and internal network addresses (SSRF protection)

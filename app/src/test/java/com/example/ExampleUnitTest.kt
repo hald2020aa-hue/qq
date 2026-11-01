@@ -539,4 +539,26 @@ class ExampleUnitTest {
         )
         assertEquals(48, task.progress)
     }
+
+    @Test
+    fun manualSiteOnboarding_supportsAnyDomainAndRtlUrlCleaning() = runBlocking {
+        // 1. Test RTL copy-paste URL cleaning (/https://starzmanga.com)
+        assertEquals("starzmanga.com", normalizeDomain("/https://starzmanga.com"))
+        assertEquals("starzmanga.com", normalizeDomain("  /https://starzmanga.com/  "))
+        assertEquals("starzmanga.com", normalizeDomain("http://starzmanga.com/manga/"))
+
+        // 2. Test empty SourceRegistry (0 pre-installed sites) + dynamic manual addition of starzmanga.com
+        val emptyRegistry = SourceRegistry(emptyList())
+        assertTrue(emptyRegistry.getAllRegistered().isEmpty())
+
+        val validator = SourceValidator(emptyRegistry)
+        val validationRes = validator.validateDomainCompatibility("/https://starzmanga.com")
+        assertTrue("Manual domain validation must succeed", validationRes.isSuccess)
+
+        val step = validationRes.getOrThrow()
+        assertEquals("starzmanga.com", step.normalizedDomain)
+        assertNotNull("Dynamic adapter must be created and matched", step.matchedSource)
+        assertTrue("Registry must now contain the newly added site", emptyRegistry.getAllRegistered().isNotEmpty())
+    }
 }
+

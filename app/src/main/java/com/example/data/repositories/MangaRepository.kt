@@ -45,6 +45,7 @@ interface SourceRepository {
     val addedSourcesFlow: Flow<List<SourceInfo>>
     val verificationSessionsFlow: StateFlow<Map<String, VerificationSession>>
     suspend fun ensureDefaultSourcesRegistered()
+    suspend fun clearAllSources()
     suspend fun resolveConnector(sourceIdOrDomain: String): MangaSource?
     suspend fun validateSiteDomain(rawInput: String): Result<SourceValidationStepResult>
     fun getSourceVerificationState(sourceIdOrDomain: String): VerificationState
@@ -73,64 +74,32 @@ class MangaRepository(
     }
 
     /**
-     * Ensures all registered connectors in [SourceRegistry] are present in the Room `sources` table
-     * on initial launch so the user never sees an empty sources drawer or unlinked source IDs.
-     * Sources that require human verification (`requiresCloudflareVerification == true`) are
-     * initialized to [VerificationState.REQUIRED] unless a valid persisted session already exists.
+     * Restores any user-added sources from the Room `sources` table into [SourceRegistry] on launch.
+     * Does NOT auto-insert pre-loaded manga websites — the user adds their desired sites manually.
      */
     override suspend fun ensureDefaultSourcesRegistered() {
         val existingSources = dao.getAllSourcesOnce()
-        val existingIds = existingSources.map { it.id }.toSet()
-        val existingDomains = existingSources.map { it.domain.lowercase() }.toSet()
-
-        for (connector in registry.getAllRegistered()) {
-            connector.attachVerificationManager(verificationManager)
-            if (connector.requiresCloudflareVerification) {
-                val currentState = verificationManager.getState(connector.domain)
-                if (currentState == VerificationState.NOT_REQUIRED && !verificationManager.isVerified(connector.domain)) {
-                    verificationManager.markVerificationRequired(
-                        sourceId = connector.id,
-                        domain = connector.domain,
-                        challengeType = VerificationChallengeType.CLOUDFLARE_CHALLENGE,
-                        reasonAr = "يتطلب هذا الموقع إكمال التحقق الأمني"
-                    )
-                }
+        for (dbSource in existingSources) {
+            val existingConnector = registry.findById(dbSource.id) ?: registry.findByDomain(dbSource.domain)
+            if (existingConnector != null) {
+                existingConnector.attachVerificationManager(verificationManager)
+                registry.register(existingConnector)
             } else {
-                if (verificationManager.getSession(connector.domain) == null) {
-                    verificationManager.repository.saveSession(
-                        sourceId = connector.id,
-                        domain = connector.domain,
-                        state = VerificationState.NOT_REQUIRED,
-                        challengeType = VerificationChallengeType.NONE,
-                        reasonAr = VerificationState.NOT_REQUIRED.labelAr
-                    )
-                }
-            }
-
-            if (connector.id !in existingIds && connector.domain.lowercase() !in existingDomains) {
-                val initialStatus = if (connector.requiresCloudflareVerification && !verificationManager.isVerified(connector.domain)) {
-                    SourceStatus.REQUIRES_VERIFICATION.name
-                } else {
-                    SourceStatus.SUPPORTED.name
-                }
-                val entity = SourceEntity(
-                    id = connector.id,
-                    name = connector.name,
-                    domain = connector.domain,
-                    baseUrl = connector.baseUrl,
-                    language = "ar",
-                    iconUrl = null,
-                    iconText = connector.iconText,
-                    iconColorHex = connector.iconColorHex,
-                    isEnabled = true,
-                    isSupported = true,
-                    status = initialStatus,
-                    version = 1,
-                    lastCheckedAt = System.currentTimeMillis()
+                val dynamic = com.example.sources.DynamicSiteSource(
+                    domain = dbSource.domain,
+                    customId = dbSource.id,
+                    customName = dbSource.name,
+                    customIconText = dbSource.iconText,
+                    customIconColorHex = dbSource.iconColorHex
                 )
-                dao.upsertSource(entity)
+                dynamic.attachVerificationManager(verificationManager)
+                registry.register(dynamic)
             }
         }
+    }
+
+    override suspend fun clearAllSources() {
+        dao.clearAllSources()
     }
 
     override suspend fun resolveConnector(sourceIdOrDomain: String): MangaSource? {
@@ -140,6 +109,16 @@ class MangaRepository(
         if (dbSource != null) {
             registry.findById(dbSource.id)?.let { return it }
             registry.findByDomain(dbSource.domain)?.let { return it }
+            val dynamic = com.example.sources.DynamicSiteSource(
+                domain = dbSource.domain,
+                customId = dbSource.id,
+                customName = dbSource.name,
+                customIconText = dbSource.iconText,
+                customIconColorHex = dbSource.iconColorHex
+            )
+            dynamic.attachVerificationManager(verificationManager)
+            registry.register(dynamic)
+            return dynamic
         }
         return null
     }
@@ -191,21 +170,39 @@ class MangaRepository(
         customSiteName: String
     ): Result<SourceInfo> {
         val connector = validationResult.matchedSource
-            ?: return Result.failure(IllegalArgumentException("لا يمكن إضافة مصدر غير متوافق."))
+            ?: com.example.sources.DynamicSiteSource(
+                domain = validationResult.normalizedDomain,
+                customName = customSiteName.trim().ifEmpty { validationResult.suggestedName }
+            )
 
         val existing = dao.getSourceByDomain(validationResult.normalizedDomain)
         val finalName = customSiteName.trim().ifEmpty { connector.name }
         val sourceId = existing?.id ?: connector.id
 
+        // Register in active SourceRegistry with the user's chosen name and ID
+        val registeredAdapter = if (connector.id != sourceId || connector.name != finalName) {
+            registry.findByDomain(validationResult.normalizedDomain) ?: com.example.sources.DynamicSiteSource(
+                domain = validationResult.normalizedDomain,
+                customId = sourceId,
+                customName = finalName,
+                customIconText = connector.iconText,
+                customIconColorHex = connector.iconColorHex
+            )
+        } else {
+            connector
+        }
+        registeredAdapter.attachVerificationManager(verificationManager)
+        registry.register(registeredAdapter)
+
         val entity = SourceEntity(
             id = sourceId,
             name = finalName,
             domain = validationResult.normalizedDomain,
-            baseUrl = connector.baseUrl,
+            baseUrl = registeredAdapter.baseUrl,
             language = "ar",
             iconUrl = null,
-            iconText = connector.iconText,
-            iconColorHex = connector.iconColorHex,
+            iconText = registeredAdapter.iconText,
+            iconColorHex = registeredAdapter.iconColorHex,
             isEnabled = true,
             isSupported = true,
             status = SourceStatus.SUPPORTED.name,

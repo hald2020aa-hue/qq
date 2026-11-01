@@ -29,6 +29,7 @@ import com.example.domain.models.MangaPage
 import com.example.domain.models.MangaSummary
 import com.example.domain.models.ReaderMode
 import com.example.domain.models.SortOption
+import com.example.domain.models.SourceDiagnosticReport
 import com.example.domain.models.SourceInfo
 import com.example.domain.models.SourceStatus
 import com.example.domain.models.StatusFilter
@@ -36,17 +37,13 @@ import com.example.sourceapi.SourceManager
 import com.example.sourceapi.SourceRegistry
 import com.example.sourceapi.SourceValidationStepResult
 import com.example.sourceapi.SourceValidator
-import com.example.sources.AzoraMangaSource
-import com.example.sources.MangaDexSource
-import com.example.sources.MangalekSource
-import com.example.sources.MangatekSource
-import com.example.sources.TeamXSource
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -59,6 +56,7 @@ sealed class ScreenRoute {
     data object Favorites : ScreenRoute()
     data object History : ScreenRoute()
     data object SourceManager : ScreenRoute()
+    data object SourceDiagnostics : ScreenRoute()
     data class Browser(val initialUrl: String = "https://www.google.com") : ScreenRoute()
     data class SourceCatalog(val sourceId: String) : ScreenRoute()
     data class MangaDetailsRoute(val mangaId: String) : ScreenRoute()
@@ -144,15 +142,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         repository = verificationRepository
     )
 
-    val registry = SourceRegistry(
-        listOf(
-            MangalekSource(),
-            TeamXSource(),
-            MangatekSource(requiresVerificationOverride = true),
-            AzoraMangaSource(),
-            MangaDexSource()
-        )
-    )
+    // Starts completely empty — all manga websites are added manually by the user
+    val registry = SourceRegistry(emptyList())
     private val validator = SourceValidator(registry, verificationManager)
     val sourceManager = SourceManager(registry, validator, verificationManager)
     private val downloadEngine = DownloadEngine(application, db, storage, registry)
@@ -241,6 +232,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _readerState = MutableStateFlow(ReaderUiState())
     val readerState: StateFlow<ReaderUiState> = _readerState.asStateFlow()
 
+    private val _diagnosticReports = MutableStateFlow<Map<String, SourceDiagnosticReport>>(emptyMap())
+    val diagnosticReports: StateFlow<Map<String, SourceDiagnosticReport>> = _diagnosticReports.asStateFlow()
+
+    private val _isRunningDiagnostics = MutableStateFlow(false)
+    val isRunningDiagnostics: StateFlow<Boolean> = _isRunningDiagnostics.asStateFlow()
+
     private val _storageStats = MutableStateFlow(
         StorageStats(
             downloadsBytes = 0L,
@@ -259,6 +256,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
+            val clearedBefore = preferences.initialSourcesClearedFlow.first()
+            if (!clearedBefore) {
+                repository.clearAllSources()
+                preferences.markInitialSourcesCleared()
+            }
             repository.ensureDefaultSourcesRegistered()
         }
         refreshStorageStats()
@@ -583,14 +585,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteSource(sourceId: String) {
         viewModelScope.launch {
             repository.removeSource(sourceId)
+            registry.unregister(sourceId)
             showToast("تم حذف المصدر")
         }
     }
 
-    fun quickAddDemoSourcesIfEmpty() {
+    fun clearAllAddedSources() {
         viewModelScope.launch {
-            repository.ensureDefaultSourcesRegistered()
-            showToast("تم تفعيل المصادر المعتمدة بنجاح")
+            repository.clearAllSources()
+            showToast("تم حذف جميع المواقع المضافة")
+        }
+    }
+
+    fun quickAddDemoSourcesIfEmpty() {
+        openAddSiteDialog("")
+    }
+
+    fun runDiagnosticsForSource(sourceId: String) {
+        viewModelScope.launch {
+            _isRunningDiagnostics.value = true
+            val connector = repository.resolveConnector(sourceId)
+            if (connector != null) {
+                val report = sourceManager.healthChecker.checkSourceHealth(connector)
+                _diagnosticReports.value = _diagnosticReports.value + (sourceId to report)
+            }
+            _isRunningDiagnostics.value = false
+        }
+    }
+
+    fun runAllSourcesDiagnostics() {
+        viewModelScope.launch {
+            _isRunningDiagnostics.value = true
+            val currentSources = addedSources.value
+            val updated = _diagnosticReports.value.toMutableMap()
+            for (src in currentSources) {
+                val connector = repository.resolveConnector(src.id) ?: continue
+                val report = sourceManager.healthChecker.checkSourceHealth(connector)
+                updated[src.id] = report
+                _diagnosticReports.value = updated.toMap()
+            }
+            _isRunningDiagnostics.value = false
+            showToast("اكتمل فحص المصادر")
         }
     }
 

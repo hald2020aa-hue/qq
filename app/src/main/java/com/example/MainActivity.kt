@@ -56,6 +56,7 @@ import com.example.features.settings.SettingsMainScreen
 import com.example.features.settings.SettingsSubScreen
 import com.example.features.sourcemanager.AddSiteAndVerificationDialogs
 import com.example.features.sourcemanager.InternalBrowserScreen
+import com.example.features.sourcemanager.SourceDiagnosticsScreen
 import com.example.features.sourcemanager.SourceManagerScreen
 import com.example.ui.theme.MangaReaderTheme
 import kotlinx.coroutines.launch
@@ -98,6 +99,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
     val showRestartBanner by vm.showRestartBanner.collectAsState()
     val showLoginPrompt by vm.showLoginPromptDialog.collectAsState()
     val loggedInEmail by vm.loggedInEmail.collectAsState()
+    val diagnosticReports by vm.diagnosticReports.collectAsState()
+    val isRunningDiagnostics by vm.isRunningDiagnostics.collectAsState()
 
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -139,7 +142,9 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                     vm.openLoginPrompt()
                 },
                 onQuickAddDemoSources = {
-                    vm.quickAddDemoSourcesIfEmpty()
+                    scope.launch { drawerState.close() }
+                    vm.navigateTo(ScreenRoute.SourceManager)
+                    vm.openAddSiteDialog("")
                 }
             )
         }
@@ -166,8 +171,8 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             onChangeGridMode = { vm.setGridDisplayMode(it) },
                             onImportSampleWork = {
                                 if (addedSources.isEmpty()) {
-                                    vm.quickAddDemoSourcesIfEmpty()
-                                    vm.navigateTo(ScreenRoute.SourceCatalog("mangalek"))
+                                    vm.navigateTo(ScreenRoute.SourceManager)
+                                    vm.openAddSiteDialog("")
                                 } else {
                                     vm.navigateTo(ScreenRoute.SourceCatalog(addedSources.first().id))
                                 }
@@ -217,8 +222,9 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             onOpenDrawer = { scope.launch { drawerState.open() } },
                             onOpenManga = { vm.navigateTo(ScreenRoute.MangaDetailsRoute(it)) },
                             onBrowseAllSources = {
-                                if (allManga.isEmpty()) {
-                                    vm.quickAddDemoSourcesIfEmpty()
+                                vm.navigateTo(ScreenRoute.SourceManager)
+                                if (addedSources.isEmpty()) {
+                                    vm.openAddSiteDialog("")
                                 }
                             }
                         )
@@ -276,7 +282,22 @@ fun MangaReaderAppRoot(vm: MainViewModel) {
                             onOpenBrowser = { url -> vm.navigateTo(ScreenRoute.Browser(url)) },
                             onToggleSource = vm::toggleSourceEnabled,
                             onDeleteSource = vm::deleteSource,
-                            onOpenSourceCatalog = { sourceId -> vm.navigateTo(ScreenRoute.SourceCatalog(sourceId)) }
+                            onOpenSourceCatalog = { sourceId -> vm.navigateTo(ScreenRoute.SourceCatalog(sourceId)) },
+                            onOpenDiagnostics = { vm.navigateTo(ScreenRoute.SourceDiagnostics) },
+                            onClearAllSources = vm::clearAllAddedSources
+                        )
+                    }
+
+                    is ScreenRoute.SourceDiagnostics -> {
+                        SourceDiagnosticsScreen(
+                            sources = addedSources,
+                            reports = diagnosticReports,
+                            isRunningDiagnostics = isRunningDiagnostics,
+                            onNavigateBack = {
+                                if (!vm.navigateBack()) vm.navigateTo(ScreenRoute.SourceManager)
+                            },
+                            onRunSingleDiagnostic = vm::runDiagnosticsForSource,
+                            onRunAllDiagnostics = vm::runAllSourcesDiagnostics
                         )
                     }
 
